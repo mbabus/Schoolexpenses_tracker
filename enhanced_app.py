@@ -22,7 +22,7 @@ def check_login():
         with st.container():
             col1, col2 = st.columns([1, 1])
             with col1:
-                st.image("Success Achievers School", width=100)
+                st.image("https://via.placeholder.com/100x100.png?text=School", width=100)
             with col2:
                 user = st.text_input("Username")
                 pwd = st.text_input("Password", type="password")
