@@ -1,0 +1,8 @@
+streamlit
+pandas
+requests
+supabase
+reportlab
+psycopg2-binary
+plotly
+xlsxwriter
