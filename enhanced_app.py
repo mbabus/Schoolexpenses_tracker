@@ -33,11 +33,10 @@ def check_login():
                     if user in users and pwd == users[user]:
                         st.session_state.logged_in = True
                         st.session_state.username = user
-                        st.experimental_rerun()
+                        st.rerun()
                     else:
                         st.error("Invalid username or password.")
         st.stop()
-
 # --- DATABASE CONNECTION (SQLITE) ---
 @st.cache_resource
 def get_connection():
