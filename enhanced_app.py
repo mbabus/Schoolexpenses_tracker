@@ -13,78 +13,72 @@ import json
 # Set page config at the very beginning before any other Streamlit command
 st.set_page_config("School Expense Tracker", layout="wide", page_icon="📚")
 
+# --- DATABASE CONNECTION (SQLITE) ---
 @st.cache_resource
 def get_connection():
+    # Create a local SQLite database
     db_path = "school_expenses.db"
     conn = sqlite3.connect(db_path, check_same_thread=False)
-
+    
+    # Create tables if they don't exist with proper schema
     with conn:
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            category TEXT,
+            description TEXT,
+            amount REAL,
+            receipt_no TEXT
+        )
+        ''')
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS uniform_stock (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item TEXT,
+            size TEXT,
+            quantity INTEGER,
+            unit_cost REAL,
+            supplier TEXT,
+            invoice_no TEXT
+        )
+        ''')
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS uniform_sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            student_name TEXT,
+            student_class TEXT,
+            item TEXT,
+            size TEXT,
+            quantity INTEGER,
+            selling_price REAL,
+            payment_mode TEXT,
+            reference TEXT,
+            receipt_id TEXT  -- Ensure this column exists for receipt tracking
+        )
+        ''')
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            receipt_id TEXT UNIQUE,
+            date TEXT,
+            customer_name TEXT,
+            items_json TEXT,  
+            total_amount REAL,
+            payment_mode TEXT,
+            reference TEXT,
+            issued_by TEXT
+        )
+        ''')
         
+        # Add receipt_id column to uniform_sales if it doesn't exist (for backward compatibility)
+        try:
+            conn.execute("ALTER TABLE uniform_sales ADD COLUMN receipt_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         
-        # Drop and recreate other tables
-        conn.execute("DROP TABLE IF EXISTS uniform_stock")
-        conn.execute("DROP TABLE IF EXISTS uniform_sales")
-        conn.execute("DROP TABLE IF EXISTS receipts")
-
-        # Create expenses table (if not exists)
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS expenses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT,
-                category TEXT,
-                description TEXT,
-                amount REAL,
-                receipt_no TEXT
-            )
-        ''')
-
-        # Recreate uniform_stock
-        conn.execute('''
-            CREATE TABLE uniform_stock (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                item TEXT,
-                size TEXT,
-                quantity INTEGER,
-                unit_cost REAL,
-                supplier TEXT,
-                invoice_no TEXT
-            )
-        ''')
-
-        # Recreate uniform_sales with receipt_id column
-        conn.execute('''
-            CREATE TABLE uniform_sales (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT,
-                student_name TEXT,
-                student_class TEXT,
-                item TEXT,
-                size TEXT,
-                quantity INTEGER,
-                selling_price REAL,
-                payment_mode TEXT,
-                reference TEXT,
-                receipt_id TEXT
-            )
-        ''')
-
-        # Recreate receipts table
-        conn.execute('''
-            CREATE TABLE receipts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                receipt_id TEXT UNIQUE,
-                date TEXT,
-                customer_name TEXT,
-                items_json TEXT,
-                total_amount REAL,
-                payment_mode TEXT,
-                reference TEXT,
-                issued_by TEXT
-            )
-        ''')
-
     return conn
-
 
 def execute_query(query, params=None, fetch=False):
     try:
@@ -247,6 +241,7 @@ def check_stock_availability(item, size, quantity):
     return False
 
 # --- MAIN APP ---
+# Check login function should be defined here (assuming it exists)
 check_login()
 
 # Sidebar with user info and app navigation
@@ -468,9 +463,6 @@ with tabs[2]:
         elif record_sale:
             st.warning("Please fill in all fields correctly.")
     
-    
-    # ... [sales search section]
-    
     with col2:
         st.subheader("🔍 Search Sales")
         search_col1, search_col2 = st.columns(2)
@@ -486,7 +478,7 @@ with tabs[2]:
         with sales_end:
             sales_to = st.date_input("Sales to", value=date.today())
             
-        # Build search query for sales - CORRECTED QUERY
+        # Build search query for sales
         sales_query = """
             SELECT id, date, student_name, student_class, item, size, quantity, selling_price, 
                    payment_mode, reference, receipt_id
@@ -523,57 +515,19 @@ with tabs[2]:
         else:
             st.info("No sales match your search criteria.")
         
-        # --- Fix for the receipt reprinting functionality ---
-
-
-# Receipt printing:
-
         # Reprint receipt section
         st.subheader("🖨️ Reprint Receipt")
         with st.expander("Reprint Receipt"):
             receipt_id_input = st.text_input("Enter Receipt ID")
             if st.button("Find Receipt") and receipt_id_input:
+                # First check the receipts table
                 receipt_query = "SELECT * FROM receipts WHERE receipt_id = ?"
                 receipt_data = execute_query(receipt_query, [receipt_id_input], fetch=True)
                 
                 if receipt_data:
                     receipt_record = receipt_data[0]
                     
-                    # Parse items from JSON
-                    items = json.loads(receipt_record[3])
-                    
-                    receipt_obj = {
-                        "receipt_id": receipt_record[1],
-                        "date": receipt_record[2],
-                        "customer_name": receipt_record[3],
-                        "items": items,
-                        "total_amount": receipt_record[4],
-                        "payment_mode": receipt_record[5],
-                        "reference": receipt_record[6],
-                        "issued_by": receipt_record[7]
-                    }
-                    
-                    receipt_html = generate_receipt_html(receipt_obj)
-                    
-                    st.components.v1.html(receipt_html, height=600)
-                    st.markdown(get_receipt_download_link(receipt_html, receipt_obj["receipt_id"]), unsafe_allow_html=True)
-                else:
-                    st.error("Receipt not found.")
-
-
-        # Reprint receipt section
-        st.subheader("🖨️ Reprint Receipt")
-        with st.expander("Reprint Receipt"):
-            receipt_id_input = st.text_input("Enter Receipt ID")
-            if st.button("Find Receipt") and receipt_id_input:
-                receipt_query = "SELECT * FROM receipts WHERE receipt_id = ?"
-                receipt_data = execute_query(receipt_query, [receipt_id_input], fetch=True)
-                
-                if receipt_data:
-                    receipt_record = receipt_data[0]
-                    
-                    # Parse items from JSON - column indices need to match your receipt table
-                    # The columns in the receipts table are:
+                    # Parse items from JSON - columns in receipts table:
                     # id, receipt_id, date, customer_name, items_json, total_amount, payment_mode, reference, issued_by
                     items = json.loads(receipt_record[4])  # items_json is at index 4
                     
@@ -593,7 +547,40 @@ with tabs[2]:
                     st.components.v1.html(receipt_html, height=600)
                     st.markdown(get_receipt_download_link(receipt_html, receipt_obj["receipt_id"]), unsafe_allow_html=True)
                 else:
-                    st.error("Receipt not found.")
+                    # If not found in receipts table, check uniform_sales
+                    sales_query = """
+                        SELECT date, student_name, item, size, quantity, selling_price, payment_mode, reference
+                        FROM uniform_sales WHERE receipt_id = ?
+                    """
+                    sale_data = execute_query(sales_query, [receipt_id_input], fetch=True)
+                    
+                    if sale_data:
+                        sale_record = sale_data[0]
+                        total_amount = sale_record[4] * sale_record[5]
+                        
+                        receipt_obj = {
+                            "receipt_id": receipt_id_input,
+                            "date": sale_record[0],
+                            "customer_name": sale_record[1] if sale_record[1] else "Walk-in Customer",
+                            "items": [{
+                                "name": sale_record[2],
+                                "size": sale_record[3],
+                                "price": sale_record[5],
+                                "quantity": sale_record[4]
+                            }],
+                            "total_amount": total_amount,
+                            "payment_mode": sale_record[6],
+                            "reference": sale_record[7],
+                            "issued_by": st.session_state.username
+                        }
+                        
+                        receipt_html = generate_receipt_html(receipt_obj)
+                        
+                        st.components.v1.html(receipt_html, height=600)
+                        st.markdown(get_receipt_download_link(receipt_html, receipt_id_input), unsafe_allow_html=True)
+                    else:
+                        st.error("Receipt not found in either receipts or sales records.")
+
 # --- Tab 4: Reports ---
 with tabs[3]:
     st.subheader("📈 Financial Reports")
