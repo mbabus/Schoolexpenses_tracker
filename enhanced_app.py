@@ -482,6 +482,9 @@ with tabs[2]:
         elif record_sale:
             st.warning("Please fill in all fields correctly.")
     
+    
+    # ... [sales search section]
+    
     with col2:
         st.subheader("🔍 Search Sales")
         search_col1, search_col2 = st.columns(2)
@@ -497,9 +500,10 @@ with tabs[2]:
         with sales_end:
             sales_to = st.date_input("Sales to", value=date.today())
             
-        # Build search query for sales
+        # Build search query for sales - CORRECTED QUERY
         sales_query = """
-            SELECT id, date, student_name, student_class, item, size, quantity, selling_price, payment_mode, reference, receipt_id
+            SELECT id, date, student_name, student_class, item, size, quantity, selling_price, 
+                   payment_mode, reference, receipt_id
             FROM uniform_sales WHERE date BETWEEN ? AND ?
         """
         sales_params = [sales_from, sales_to]
@@ -534,9 +538,9 @@ with tabs[2]:
             st.info("No sales match your search criteria.")
         
         # --- Fix for the receipt reprinting functionality ---
-# The issue is in the reprint receipt section where you're trying to parse the receipt data incorrectly
 
-# Find this code in Tab 3: Uniform Sales (around line 425-450):
+
+# Receipt printing:
 
         # Reprint receipt section
         st.subheader("🖨️ Reprint Receipt")
