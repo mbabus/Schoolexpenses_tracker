@@ -6,3 +6,4 @@ reportlab
 psycopg2-binary
 plotly
 xlsxwriter
+uuid
