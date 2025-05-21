@@ -13,92 +13,78 @@ import json
 # Set page config at the very beginning before any other Streamlit command
 st.set_page_config("School Expense Tracker", layout="wide", page_icon="📚")
 
-# --- LOGIN GATE ---
-def check_login():
-    users = {
-        "admin": "admin123",
-        "user1": "user123"
-    }
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
-
-    if not st.session_state.logged_in:
-        st.title("🔒 School Expense Login")
-        with st.container():
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                st.image("https://via.placeholder.com/100x100.png?text=School", width=100)
-            with col2:
-                user = st.text_input("Username")
-                pwd = st.text_input("Password", type="password")
-                if st.button("Login", use_container_width=True):
-                    if user in users and pwd == users[user]:
-                        st.session_state.logged_in = True
-                        st.session_state.username = user
-                        st.rerun()
-                    else:
-                        st.error("Invalid username or password.")
-        st.stop()
-        
-# --- DATABASE CONNECTION (SQLITE) ---
 @st.cache_resource
 def get_connection():
-    # Create a local SQLite database
     db_path = "school_expenses.db"
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    
-    # Create tables if they don't exist
+
     with conn:
+        
+        
+        # Drop and recreate other tables
+        conn.execute("DROP TABLE IF EXISTS uniform_stock")
+        conn.execute("DROP TABLE IF EXISTS uniform_sales")
+        conn.execute("DROP TABLE IF EXISTS receipts")
+
+        # Create expenses table (if not exists)
         conn.execute('''
-        CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT,
-            category TEXT,
-            description TEXT,
-            amount REAL,
-            receipt_no TEXT
-        )
+            CREATE TABLE IF NOT EXISTS expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT,
+                category TEXT,
+                description TEXT,
+                amount REAL,
+                receipt_no TEXT
+            )
         ''')
+
+        # Recreate uniform_stock
         conn.execute('''
-        CREATE TABLE IF NOT EXISTS uniform_stock (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item TEXT,
-            size TEXT,
-            quantity INTEGER,
-            unit_cost REAL,
-            supplier TEXT,
-            invoice_no TEXT
-        )
+            CREATE TABLE uniform_stock (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item TEXT,
+                size TEXT,
+                quantity INTEGER,
+                unit_cost REAL,
+                supplier TEXT,
+                invoice_no TEXT
+            )
         ''')
+
+        # Recreate uniform_sales with receipt_id column
         conn.execute('''
-        CREATE TABLE IF NOT EXISTS uniform_sales (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT,
-            student_name TEXT,
-            student_class TEXT,
-            item TEXT,
-            size TEXT,
-            quantity INTEGER,
-            selling_price REAL,
-            payment_mode TEXT,
-            reference TEXT,
-            receipt_id TEXT
-        )
+            CREATE TABLE uniform_sales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT,
+                student_name TEXT,
+                student_class TEXT,
+                item TEXT,
+                size TEXT,
+                quantity INTEGER,
+                selling_price REAL,
+                payment_mode TEXT,
+                reference TEXT,
+                receipt_id TEXT
+            )
         ''')
+
+        # Recreate receipts table
         conn.execute('''
-        CREATE TABLE IF NOT EXISTS receipts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            receipt_id TEXT UNIQUE,
-            date TEXT,
-            customer_name TEXT,
-            items_json TEXT,  
-            total_amount REAL,
-            payment_mode TEXT,
-            reference TEXT,
-            issued_by TEXT
-        )
+            CREATE TABLE receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                receipt_id TEXT UNIQUE,
+                date TEXT,
+                customer_name TEXT,
+                items_json TEXT,
+                total_amount REAL,
+                payment_mode TEXT,
+                reference TEXT,
+                issued_by TEXT
+            )
         ''')
+
     return conn
+
 
 def execute_query(query, params=None, fetch=False):
     try:
