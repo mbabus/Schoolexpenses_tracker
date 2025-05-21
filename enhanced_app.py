@@ -151,9 +151,9 @@ def get_excel_download_link(df, filename, text):
 # --- RECEIPT GENERATION FUNCTIONS ---
 def generate_receipt_html(receipt_data):
     """Generates HTML content for a receipt"""
-    school_name = "ABC School"
-    school_address = "123 Education Way, School District"
-    school_contact = "Tel: 123-456-7890 | Email: info@abcschool.edu"
+    school_name = "SUCCESS ACHIEVERS SCHOOL"
+    school_address = "395 Nkubu,Meru"
+    school_contact = "Tel: 0720340953 | Email: info@successachievers.co.ke"
     
     receipt_html = f"""
     <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; border: 1px solid #ccc;">
@@ -533,6 +533,11 @@ with tabs[2]:
         else:
             st.info("No sales match your search criteria.")
         
+        # --- Fix for the receipt reprinting functionality ---
+# The issue is in the reprint receipt section where you're trying to parse the receipt data incorrectly
+
+# Find this code in Tab 3: Uniform Sales (around line 425-450):
+
         # Reprint receipt section
         st.subheader("🖨️ Reprint Receipt")
         with st.expander("Reprint Receipt"):
@@ -565,6 +570,40 @@ with tabs[2]:
                 else:
                     st.error("Receipt not found.")
 
+
+        # Reprint receipt section
+        st.subheader("🖨️ Reprint Receipt")
+        with st.expander("Reprint Receipt"):
+            receipt_id_input = st.text_input("Enter Receipt ID")
+            if st.button("Find Receipt") and receipt_id_input:
+                receipt_query = "SELECT * FROM receipts WHERE receipt_id = ?"
+                receipt_data = execute_query(receipt_query, [receipt_id_input], fetch=True)
+                
+                if receipt_data:
+                    receipt_record = receipt_data[0]
+                    
+                    # Parse items from JSON - column indices need to match your receipt table
+                    # The columns in the receipts table are:
+                    # id, receipt_id, date, customer_name, items_json, total_amount, payment_mode, reference, issued_by
+                    items = json.loads(receipt_record[4])  # items_json is at index 4
+                    
+                    receipt_obj = {
+                        "receipt_id": receipt_record[1],  # receipt_id
+                        "date": receipt_record[2],        # date
+                        "customer_name": receipt_record[3],  # customer_name
+                        "items": items,                   # parsed from items_json
+                        "total_amount": receipt_record[5],  # total_amount
+                        "payment_mode": receipt_record[6],  # payment_mode
+                        "reference": receipt_record[7],   # reference
+                        "issued_by": receipt_record[8]    # issued_by
+                    }
+                    
+                    receipt_html = generate_receipt_html(receipt_obj)
+                    
+                    st.components.v1.html(receipt_html, height=600)
+                    st.markdown(get_receipt_download_link(receipt_html, receipt_obj["receipt_id"]), unsafe_allow_html=True)
+                else:
+                    st.error("Receipt not found.")
 # --- Tab 4: Reports ---
 with tabs[3]:
     st.subheader("📈 Financial Reports")
