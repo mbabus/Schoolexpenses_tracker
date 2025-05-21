@@ -6,141 +6,155 @@ from datetime import date, datetime, timedelta
 import plotly.express as px
 import io
 import base64
-import os
 import uuid
 import json
 
-# Set page config at the very beginning before any other Streamlit command
-st.set_page_config("School Expense Tracker", layout="wide", page_icon="📚")
+# ======================
+# APP CONFIGURATION
+# ======================
+st.set_page_config(
+    page_title="School Expense Tracker",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# --- DATABASE CONNECTION (SQLITE) ---
-@st.cache_resource
-def get_connection():
-    # Create a local SQLite database
-    db_path = "school_expenses.db"
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+# ======================
+# DATABASE FUNCTIONS
+# ======================
+def init_database():
+    """Initialize the database with required tables"""
+    conn = sqlite3.connect('school_expenses.db', check_same_thread=False)
+    cursor = conn.cursor()
     
-    # Create tables if they don't exist with proper schema
-    with conn:
-        conn.execute('''
-        CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT,
-            category TEXT,
-            description TEXT,
-            amount REAL,
-            receipt_no TEXT
-        )
-        ''')
-        conn.execute('''
-        CREATE TABLE IF NOT EXISTS uniform_stock (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item TEXT,
-            size TEXT,
-            quantity INTEGER,
-            unit_cost REAL,
-            supplier TEXT,
-            invoice_no TEXT
-        )
-        ''')
-        conn.execute('''
-        CREATE TABLE IF NOT EXISTS uniform_sales (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT,
-            student_name TEXT,
-            student_class TEXT,
-            item TEXT,
-            size TEXT,
-            quantity INTEGER,
-            selling_price REAL,
-            payment_mode TEXT,
-            reference TEXT,
-            receipt_id TEXT  -- Ensure this column exists for receipt tracking
-        )
-        ''')
-        conn.execute('''
-        CREATE TABLE IF NOT EXISTS receipts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            receipt_id TEXT UNIQUE,
-            date TEXT,
-            customer_name TEXT,
-            items_json TEXT,  
-            total_amount REAL,
-            payment_mode TEXT,
-            reference TEXT,
-            issued_by TEXT
-        )
-        ''')
-        
-        # Add receipt_id column to uniform_sales if it doesn't exist (for backward compatibility)
-        try:
-            conn.execute("ALTER TABLE uniform_sales ADD COLUMN receipt_id TEXT")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-        
+    # Create tables if they don't exist
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        category TEXT NOT NULL,
+        description TEXT,
+        amount REAL NOT NULL,
+        receipt_no TEXT
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS uniform_stock (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item TEXT NOT NULL,
+        size TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_cost REAL NOT NULL,
+        supplier TEXT,
+        invoice_no TEXT,
+        last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS uniform_sales (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        student_name TEXT,
+        student_class TEXT,
+        item TEXT NOT NULL,
+        size TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        selling_price REAL NOT NULL,
+        payment_mode TEXT NOT NULL,
+        reference TEXT,
+        receipt_id TEXT UNIQUE
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS receipts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        receipt_id TEXT UNIQUE NOT NULL,
+        date TEXT NOT NULL,
+        customer_name TEXT,
+        items_json TEXT NOT NULL,
+        total_amount REAL NOT NULL,
+        payment_mode TEXT NOT NULL,
+        reference TEXT,
+        issued_by TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # Add receipt_id column if it doesn't exist (for backward compatibility)
+    try:
+        cursor.execute("ALTER TABLE uniform_sales ADD COLUMN receipt_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+    
+    conn.commit()
     return conn
 
-def execute_query(query, params=None, fetch=False):
+@st.cache_resource
+def get_db_connection():
+    """Get a cached database connection"""
+    return init_database()
+
+def execute_query(_conn, query, params=None, fetch=False):
+    """Execute a SQL query with error handling"""
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # Convert PostgreSQL-style queries to SQLite syntax
-        query = query.replace("%s", "?")
-        query = query.replace("ILIKE", "LIKE")
-        
-        # Handle date_trunc function
-        if "date_trunc" in query:
-            query = query.replace("date_trunc('month', date)", "strftime('%Y-%m', date)")
-        
+        cursor = _conn.cursor()
         if params:
             cursor.execute(query, params)
         else:
             cursor.execute(query)
-            
+        
         if fetch:
             result = cursor.fetchall()
         else:
+            _conn.commit()
             result = True
-            conn.commit()
-            
+        
         return result
-    except Exception:
-        st.error("❌ Database error occurred:")
+    except Exception as e:
+        st.error(f"Database error: {str(e)}")
         st.code(traceback.format_exc())
         return None
 
-# --- UTILITY FUNCTIONS ---
+# ======================
+# UTILITY FUNCTIONS
+# ======================
+def generate_unique_id(prefix=""):
+    """Generate a unique ID with optional prefix"""
+    return f"{prefix}{uuid.uuid4().hex[:8].upper()}"
+
+def format_currency(amount):
+    """Format amount as currency"""
+    return f"KES {amount:,.2f}"
+
 def get_download_link(df, filename, text):
-    """Generates a link allowing the data in a given pandas dataframe to be downloaded"""
+    """Generate a CSV download link"""
     csv = df.to_csv(index=False)
     b64 = base64.b64encode(csv.encode()).decode()
-    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}.csv">{text}</a>'
-    return href
+    return f'<a href="data:file/csv;base64,{b64}" download="{filename}.csv">{text}</a>'
 
-def get_excel_download_link(df, filename, text):
-    """Generates an Excel download link for the given dataframe"""
+def get_excel_link(df, filename, text):
+    """Generate an Excel download link"""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, sheet_name='Sheet1', index=False)
+        df.to_excel(writer, index=False)
     excel_data = output.getvalue()
     b64 = base64.b64encode(excel_data).decode()
-    href = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}.xlsx">{text}</a>'
-    return href
+    return f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}.xlsx">{text}</a>'
 
-# --- RECEIPT GENERATION FUNCTIONS ---
+# ======================
+# RECEIPT FUNCTIONS
+# ======================
 def generate_receipt_html(receipt_data):
-    """Generates HTML content for a receipt"""
-    school_name = "SUCCESS ACHIEVERS SCHOOL"
-    school_address = "395 Nkubu,Meru"
-    school_contact = "Tel: 0720340953 | Email: info@successachievers.co.ke"
-    
-    receipt_html = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; border: 1px solid #ccc;">
+    """Generate HTML receipt"""
+    html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 5px;">
         <div style="text-align: center; margin-bottom: 20px;">
-            <h2>{school_name}</h2>
-            <p>{school_address}<br>{school_contact}</p>
-            <h3>RECEIPT</h3>
+            <h2>SUCCESS ACHIEVERS SCHOOL</h2>
+            <p>395 Nkubu, Meru | Tel: 0720340953</p>
+            <h3 style="border-top: 1px solid #ddd; border-bottom: 1px solid #ddd; padding: 10px 0;">RECEIPT</h3>
         </div>
         
         <div style="display: flex; justify-content: space-between; margin-bottom: 20px;">
@@ -149,15 +163,15 @@ def generate_receipt_html(receipt_data):
                 <p><strong>Date:</strong> {receipt_data['date']}</p>
             </div>
             <div>
-                <p><strong>Student:</strong> {receipt_data['customer_name']}</p>
+                <p><strong>Student:</strong> {receipt_data['customer_name'] or 'Walk-in Customer'}</p>
                 <p><strong>Payment Method:</strong> {receipt_data['payment_mode']}</p>
-                <p><strong>Reference:</strong> {receipt_data['reference']}</p>
+                <p><strong>Reference:</strong> {receipt_data['reference'] or 'N/A'}</p>
             </div>
         </div>
         
         <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
             <thead>
-                <tr style="background-color: #f2f2f2;">
+                <tr style="background-color: #f5f5f5;">
                     <th style="border: 1px solid #ddd; padding: 8px; text-align: left;">Item</th>
                     <th style="border: 1px solid #ddd; padding: 8px; text-align: left;">Size</th>
                     <th style="border: 1px solid #ddd; padding: 8px; text-align: right;">Price</th>
@@ -168,640 +182,729 @@ def generate_receipt_html(receipt_data):
             <tbody>
     """
     
-    # Add items to the receipt
     for item in receipt_data['items']:
         amount = item['price'] * item['quantity']
-        receipt_html += f"""
+        html += f"""
                 <tr>
                     <td style="border: 1px solid #ddd; padding: 8px;">{item['name']}</td>
                     <td style="border: 1px solid #ddd; padding: 8px;">{item['size']}</td>
-                    <td style="border: 1px solid #ddd; padding: 8px; text-align: right;">KES {item['price']:,.2f}</td>
+                    <td style="border: 1px solid #ddd; padding: 8px; text-align: right;">{format_currency(item['price'])}</td>
                     <td style="border: 1px solid #ddd; padding: 8px; text-align: right;">{item['quantity']}</td>
-                    <td style="border: 1px solid #ddd; padding: 8px; text-align: right;">KES {amount:,.2f}</td>
+                    <td style="border: 1px solid #ddd; padding: 8px; text-align: right;">{format_currency(amount)}</td>
                 </tr>
         """
     
-    receipt_html += f"""
+    html += f"""
             </tbody>
             <tfoot>
                 <tr>
                     <td colspan="4" style="border: 1px solid #ddd; padding: 8px; text-align: right;"><strong>Total:</strong></td>
-                    <td style="border: 1px solid #ddd; padding: 8px; text-align: right;"><strong>KES {receipt_data['total_amount']:,.2f}</strong></td>
+                    <td style="border: 1px solid #ddd; padding: 8px; text-align: right;"><strong>{format_currency(receipt_data['total_amount'])}</strong></td>
                 </tr>
             </tfoot>
         </table>
         
-        <div style="margin-top: 40px;">
+        <div style="margin-top: 30px; text-align: right;">
             <p><strong>Issued By:</strong> {receipt_data['issued_by']}</p>
+            <p style="font-size: 0.9em; color: #666;">{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         </div>
         
-        <div style="text-align: center; margin-top: 40px; font-size: 12px;">
+        <div style="text-align: center; margin-top: 40px; font-size: 0.8em; color: #777;">
             <p>Thank you for your business!</p>
-            <p>This is a computer-generated receipt and does not require a signature.</p>
+            <p>This is a computer-generated receipt</p>
         </div>
     </div>
     """
-    
-    return receipt_html
+    return html
 
-def get_receipt_download_link(receipt_html, receipt_id):
-    """Generates a download link for the receipt HTML content"""
-    b64 = base64.b64encode(receipt_html.encode()).decode()
-    href = f'<a href="data:text/html;base64,{b64}" download="receipt_{receipt_id}.html" target="_blank">📄 Download Receipt</a>'
-    return href
-
-def save_receipt_to_db(receipt_data):
-    """Save receipt data to the database"""
+def save_receipt(conn, receipt_data):
+    """Save receipt to database"""
     try:
-        # Convert items list to JSON string
         items_json = json.dumps(receipt_data['items'])
-        
-        success = execute_query(
-            """INSERT INTO receipts 
-               (receipt_id, date, customer_name, items_json, total_amount, payment_mode, reference, issued_by) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (receipt_data['receipt_id'], receipt_data['date'], receipt_data['customer_name'],
-             items_json, receipt_data['total_amount'], receipt_data['payment_mode'],
-             receipt_data['reference'], receipt_data['issued_by'])
+        query = """
+            INSERT INTO receipts (
+                receipt_id, date, customer_name, items_json, 
+                total_amount, payment_mode, reference, issued_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        params = (
+            receipt_data['receipt_id'],
+            receipt_data['date'],
+            receipt_data['customer_name'],
+            items_json,
+            receipt_data['total_amount'],
+            receipt_data['payment_mode'],
+            receipt_data['reference'],
+            receipt_data['issued_by']
         )
-        return success
+        return execute_query(conn, query, params)
     except Exception as e:
-        st.error(f"Error saving receipt: {str(e)}")
+        st.error(f"Failed to save receipt: {str(e)}")
         return False
 
-def check_stock_availability(item, size, quantity):
-    """Check if sufficient stock exists for a sale"""
-    stock = execute_query(
-        "SELECT quantity FROM uniform_stock WHERE item = ? AND size = ?",
-        (item, size),
-        fetch=True
-    )
-    if stock and stock[0][0] >= quantity:
-        return True
-    return False
+# ======================
+# STOCK MANAGEMENT
+# ======================
+def check_stock_availability(conn, item, size, quantity):
+    """Check if sufficient stock exists"""
+    query = """
+        SELECT quantity FROM uniform_stock 
+        WHERE item = ? AND size = ? AND quantity >= ?
+    """
+    result = execute_query(conn, query, (item, size, quantity), fetch=True)
+    return bool(result)
 
-# --- MAIN APP ---
-# Check login function should be defined here (assuming it exists)
-check_login()
+def update_stock(conn, item, size, quantity_change):
+    """Update stock quantity"""
+    query = """
+        UPDATE uniform_stock 
+        SET quantity = quantity + ?, last_updated = CURRENT_TIMESTAMP
+        WHERE item = ? AND size = ?
+    """
+    return execute_query(conn, query, (quantity_change, item, size))
 
-# Sidebar with user info and app navigation
-with st.sidebar:
-    st.write(f"👤 Logged in as: **{st.session_state.username}**")
-    st.divider()
+# ======================
+# APPLICATION PAGES
+# ======================
+def show_expenses_tab(conn):
+    """Expenses management tab"""
+    st.header("💰 Expense Management")
     
-    st.subheader("💰 Quick Stats")
-    total_expenses = execute_query("SELECT SUM(amount) FROM expenses", fetch=True)
-    total_sales = execute_query("SELECT SUM(quantity * selling_price) FROM uniform_sales", fetch=True)
-    
-    if total_expenses and total_expenses[0][0]:
-        st.metric("Total Expenses", f"KES {total_expenses[0][0]:,.2f}")
-    if total_sales and total_sales[0][0]:
-        st.metric("Uniform Sales", f"KES {total_sales[0][0]:,.2f}")
-    
-    if st.button("Logout", type="primary"):
-        st.session_state.logged_in = False
-        st.rerun()
-
-# Main content
-st.title("📚 School Expense and Uniform Tracker")
-st.caption(f"Today's date: {date.today().strftime('%B %d, %Y')}")
-
-tabs = st.tabs(["Expenses", "Uniform Stock", "Uniform Sales", "Reports", "Dashboard", "Settings"])
-
-# --- Tab 1: Expenses ---
-with tabs[0]:
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        st.subheader("➕ Add Expense")
+    with st.expander("➕ Add New Expense", expanded=True):
         with st.form("expense_form"):
-            exp_date = st.date_input("Date", value=date.today())
-            category = st.selectbox("Category", 
-                ["Stationery", "Food", "Fuel", "Mechanic", "Development", "Utilities", 
-                 "Maintenance", "Salaries", "Events", "Transportation", "Other"])
+            cols = st.columns(3)
+            with cols[0]:
+                exp_date = st.date_input("Date", value=date.today())
+            with cols[1]:
+                category = st.selectbox("Category", [
+                    "Stationery", "Food", "Fuel", "Maintenance",
+                    "Salaries", "Utilities", "Transport", "Events", "Other"
+                ])
+            with cols[2]:
+                amount = st.number_input("Amount (KES)", min_value=0.0, step=0.01)
+            
             description = st.text_input("Description")
-            amount = st.number_input("Amount (KES)", min_value=0.0, format="%.2f")
-            receipt_no = st.text_input("Receipt Number (optional)")
-            submit = st.form_submit_button("Save Expense")
-
-        if submit and description.strip() and amount > 0:
-            success = execute_query(
-                "INSERT INTO expenses (date, category, description, amount, receipt_no) VALUES (?, ?, ?, ?, ?)",
-                (exp_date, category, description, amount, receipt_no)
-            )
-            if success:
-                st.success("✅ Expense recorded successfully!")
-        elif submit:
-            st.warning("Please enter a description and amount.")
-    
-    with col2:
-        st.subheader("🔍 Search Expenses")
-        search_col1, search_col2 = st.columns(2)
-        
-        with search_col1:
-            search_term = st.text_input("Search by description")
-        with search_col2:
-            search_category = st.multiselect("Filter by category", 
-                ["All Categories", "Stationery", "Food", "Fuel", "Mechanic", "Development", 
-                 "Utilities", "Maintenance", "Salaries", "Events", "Transportation", "Other"],
-                default=["All Categories"])
-
-        start_date, end_date = st.columns(2)
-        with start_date:
-            from_date = st.date_input("From date", value=date.today() - timedelta(days=30))
-        with end_date:
-            to_date = st.date_input("To date", value=date.today())
-
-        # Build search query
-        query = "SELECT id, date, category, description, amount, receipt_no FROM expenses WHERE date BETWEEN ? AND ?"
-        params = [from_date, to_date]
-        
-        if search_term:
-            query += " AND description LIKE ?"
-            params.append(f"%{search_term}%")
+            receipt_no = st.text_input("Receipt/Invoice Number (optional)")
             
-        if "All Categories" not in search_category and search_category:
-            placeholders = ", ".join(["?"] * len(search_category))
-            query += f" AND category IN ({placeholders})"
-            params.extend(search_category)
-            
-        query += " ORDER BY date DESC"
-        
-        # Execute search
-        expenses = execute_query(query, params, fetch=True)
-        
-        if expenses:
-            expenses_df = pd.DataFrame(expenses, columns=["ID", "Date", "Category", "Description", "Amount", "Receipt"])
-            st.dataframe(expenses_df, use_container_width=True)
-            
-            # Download buttons for search results
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown(get_download_link(expenses_df, "expenses_search", "📥 Download as CSV"), unsafe_allow_html=True)
-            with col2:
-                st.markdown(get_excel_download_link(expenses_df, "expenses_search", "📊 Download as Excel"), unsafe_allow_html=True)
-        else:
-            st.info("No expenses match your search criteria.")
-
-# --- Tab 2: Uniform Stock ---
-with tabs[1]:
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        st.subheader("📦 Add Uniform Stock")
-        with st.form("stock_form"):
-            item = st.selectbox("Item", ["Sweater", "Tracksuit", "Dress", "Tshirt", "Trousers", "Shirt", "Tie", "Socks", "Blazer", "PE Kit"])
-            size = st.text_input("Size")
-            qty = st.number_input("Quantity", min_value=1, step=1)
-            price = st.number_input("Unit Price (KES)", min_value=0.0)
-            supplier = st.text_input("Supplier (optional)")
-            invoice_no = st.text_input("Invoice Number (optional)")
-            save_stock = st.form_submit_button("Add to Stock")
-
-        if save_stock and size.strip() and qty > 0 and price > 0:
-            success = execute_query(
-                "INSERT INTO uniform_stock (item, size, quantity, unit_cost, supplier, invoice_no) VALUES (?, ?, ?, ?, ?, ?)",
-                (item, size, qty, price, supplier, invoice_no)
-            )
-            if success:
-                st.success("✅ Stock entry added!")
-        elif save_stock:
-            st.warning("Please complete all fields correctly.")
-    
-    with col2:
-        st.subheader("📊 Current Stock")
-        stock = execute_query(
-            "SELECT item, size, quantity, unit_cost, supplier FROM uniform_stock ORDER BY item, size", fetch=True
-        )
-        if stock:
-            stock_df = pd.DataFrame(stock, columns=["Item", "Size", "Quantity", "Unit Cost", "Supplier"])
-            st.dataframe(stock_df, use_container_width=True)
-            
-            # Download buttons for stock
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown(get_download_link(stock_df, "uniform_stock", "📥 Download as CSV"), unsafe_allow_html=True)
-            with col2:
-                st.markdown(get_excel_download_link(stock_df, "uniform_stock", "📊 Download as Excel"), unsafe_allow_html=True)
-        else:
-            st.info("No stock data found.")
-
-# --- Tab 3: Uniform Sales ---
-with tabs[2]:
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        st.subheader("🛍 Record Uniform Sale")
-        with st.form("sales_form"):
-            sdate = st.date_input("Date of Sale", value=date.today())
-            student_name = st.text_input("Student Name (optional)")
-            student_class = st.text_input("Class/Grade (optional)")
-            stype = st.selectbox("Item", ["Sweater", "Tracksuit", "Dress", "Tshirt", "Trousers", "Shirt", "Tie", "Socks", "Blazer", "PE Kit"])
-            ssize = st.text_input("Size")
-            sqty = st.number_input("Quantity", min_value=1, step=1)
-            sprice = st.number_input("Selling Price (KES)", min_value=0.0)
-            pmode = st.selectbox("Payment Mode", ["Cash", "Sacco Paybill", "Bank", "M-Pesa", "Cheque", "Other"])
-            sref = st.text_input("Payment Reference")
-            print_receipt = st.checkbox("Generate Receipt", value=True)
-            record_sale = st.form_submit_button("Record Sale")
-
-        if record_sale and ssize.strip() and sqty > 0 and sprice > 0:
-            # Check stock availability
-            if not check_stock_availability(stype, ssize, sqty):
-                st.error("❌ Insufficient stock for this item/size!")
-            else:
-                # Generate a unique receipt ID
-                receipt_id = f"REC-{date.today().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
-                
-                success = execute_query(
-                    """INSERT INTO uniform_sales 
-                       (date, student_name, student_class, item, size, quantity, selling_price, payment_mode, reference, receipt_id) 
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (sdate, student_name, student_class, stype, ssize, sqty, sprice, pmode, sref, receipt_id)
-                )
-                if success:
-                    # Update stock quantity
-                    execute_query(
-                        "UPDATE uniform_stock SET quantity = quantity - ? WHERE item = ? AND size = ?",
-                        (sqty, stype, ssize)
-                    )
-                    
-                    st.success("✅ Sale recorded successfully!")
-                    
-                    # Generate receipt if requested
-                    if print_receipt:
-                        total_amount = sqty * sprice
-                        
-                        receipt_data = {
-                            "receipt_id": receipt_id,
-                            "date": sdate.strftime("%B %d, %Y"),
-                            "customer_name": student_name if student_name else "Walk-in Customer",
-                            "items": [
-                                {
-                                    "name": stype,
-                                    "size": ssize,
-                                    "price": sprice,
-                                    "quantity": sqty
-                                }
-                            ],
-                            "total_amount": total_amount,
-                            "payment_mode": pmode,
-                            "reference": sref,
-                            "issued_by": st.session_state.username
-                        }
-                        
-                        # Save receipt to database
-                        save_receipt_to_db(receipt_data)
-                        
-                        # Generate receipt HTML
-                        receipt_html = generate_receipt_html(receipt_data)
-                        
-                        # Display receipt in an expander
-                        with st.expander("📄 View Receipt", expanded=True):
-                            st.components.v1.html(receipt_html, height=600)
-                            st.markdown(get_receipt_download_link(receipt_html, receipt_id), unsafe_allow_html=True)
-        elif record_sale:
-            st.warning("Please fill in all fields correctly.")
-    
-    with col2:
-        st.subheader("🔍 Search Sales")
-        search_col1, search_col2 = st.columns(2)
-        
-        with search_col1:
-            sales_search = st.text_input("Search by student name or reference")
-        with search_col2:
-            sales_item = st.selectbox("Filter by item", ["All Items", "Sweater", "Tracksuit", "Dress", "Tshirt", "Trousers", "Shirt", "Tie", "Socks", "Blazer", "PE Kit"])
-
-        sales_start, sales_end = st.columns(2)
-        with sales_start:
-            sales_from = st.date_input("Sales from", value=date.today() - timedelta(days=30))
-        with sales_end:
-            sales_to = st.date_input("Sales to", value=date.today())
-            
-        # Build search query for sales
-        sales_query = """
-            SELECT id, date, student_name, student_class, item, size, quantity, selling_price, 
-                   payment_mode, reference, receipt_id
-            FROM uniform_sales WHERE date BETWEEN ? AND ?
-        """
-        sales_params = [sales_from, sales_to]
-        
-        if sales_search:
-            sales_query += " AND (student_name LIKE ? OR reference LIKE ?)"
-            sales_params.extend([f"%{sales_search}%", f"%{sales_search}%"])
-            
-        if sales_item != "All Items":
-            sales_query += " AND item = ?"
-            sales_params.append(sales_item)
-            
-        sales_query += " ORDER BY date DESC"
-        
-        # Execute sales search
-        sales = execute_query(sales_query, sales_params, fetch=True)
-        
-        if sales:
-            sales_df = pd.DataFrame(sales, columns=["ID", "Date", "Student", "Class", "Item", "Size", "Quantity", "Price", "Payment", "Reference", "Receipt ID"])
-            sales_df["Total"] = sales_df["Quantity"] * sales_df["Price"]
-            
-            # Display the dataframe
-            st.dataframe(sales_df, use_container_width=True)
-            
-            # Download buttons for sales results
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown(get_download_link(sales_df, "uniform_sales", "📥 Download as CSV"), unsafe_allow_html=True)
-            with col2:
-                st.markdown(get_excel_download_link(sales_df, "uniform_sales", "📊 Download as Excel"), unsafe_allow_html=True)
-        else:
-            st.info("No sales match your search criteria.")
-        
-        # Reprint receipt section
-        st.subheader("🖨️ Reprint Receipt")
-        with st.expander("Reprint Receipt"):
-            receipt_id_input = st.text_input("Enter Receipt ID")
-            if st.button("Find Receipt") and receipt_id_input:
-                # First check the receipts table
-                receipt_query = "SELECT * FROM receipts WHERE receipt_id = ?"
-                receipt_data = execute_query(receipt_query, [receipt_id_input], fetch=True)
-                
-                if receipt_data:
-                    receipt_record = receipt_data[0]
-                    
-                    # Parse items from JSON - columns in receipts table:
-                    # id, receipt_id, date, customer_name, items_json, total_amount, payment_mode, reference, issued_by
-                    items = json.loads(receipt_record[4])  # items_json is at index 4
-                    
-                    receipt_obj = {
-                        "receipt_id": receipt_record[1],  # receipt_id
-                        "date": receipt_record[2],        # date
-                        "customer_name": receipt_record[3],  # customer_name
-                        "items": items,                   # parsed from items_json
-                        "total_amount": receipt_record[5],  # total_amount
-                        "payment_mode": receipt_record[6],  # payment_mode
-                        "reference": receipt_record[7],   # reference
-                        "issued_by": receipt_record[8]    # issued_by
-                    }
-                    
-                    receipt_html = generate_receipt_html(receipt_obj)
-                    
-                    st.components.v1.html(receipt_html, height=600)
-                    st.markdown(get_receipt_download_link(receipt_html, receipt_obj["receipt_id"]), unsafe_allow_html=True)
-                else:
-                    # If not found in receipts table, check uniform_sales
-                    sales_query = """
-                        SELECT date, student_name, item, size, quantity, selling_price, payment_mode, reference
-                        FROM uniform_sales WHERE receipt_id = ?
+            if st.form_submit_button("Save Expense"):
+                if amount > 0 and description.strip():
+                    query = """
+                        INSERT INTO expenses (date, category, description, amount, receipt_no)
+                        VALUES (?, ?, ?, ?, ?)
                     """
-                    sale_data = execute_query(sales_query, [receipt_id_input], fetch=True)
+                    if execute_query(conn, query, (exp_date, category, description, amount, receipt_no)):
+                        st.success("Expense recorded successfully!")
+                else:
+                    st.warning("Please enter a valid amount and description")
+
+    st.subheader("🔍 Expense Records")
+    with st.expander("Filter Expenses"):
+        cols = st.columns(3)
+        with cols[0]:
+            start_date = st.date_input("From", value=date.today() - timedelta(days=30))
+        with cols[1]:
+            end_date = st.date_input("To", value=date.today())
+        with cols[2]:
+            categories = st.multiselect("Categories", [
+                "Stationery", "Food", "Fuel", "Maintenance",
+                "Salaries", "Utilities", "Transport", "Events", "Other"
+            ])
+        
+        search_term = st.text_input("Search Description")
+
+    # Build query
+    query = "SELECT date, category, description, amount, receipt_no FROM expenses WHERE date BETWEEN ? AND ?"
+    params = [start_date, end_date]
+    
+    if categories:
+        query += " AND category IN (" + ",".join(["?"] * len(categories)) + ")"
+        params.extend(categories)
+    
+    if search_term:
+        query += " AND description LIKE ?"
+        params.append(f"%{search_term}%")
+    
+    query += " ORDER BY date DESC"
+    
+    expenses = execute_query(conn, query, params, fetch=True)
+    if expenses:
+        df = pd.DataFrame(expenses, columns=["Date", "Category", "Description", "Amount", "Receipt No"])
+        st.dataframe(df, use_container_width=True)
+        
+        # Summary stats
+        total_expenses = df['Amount'].sum()
+        st.metric("Total Expenses", format_currency(total_expenses))
+        
+        # Download options
+        st.markdown(get_download_link(df, "expenses_report", "📥 Download as CSV"), unsafe_allow_html=True)
+    else:
+        st.info("No expenses found for the selected filters")
+
+def show_stock_tab(conn):
+    """Uniform stock management tab"""
+    st.header("👕 Uniform Stock Management")
+    
+    with st.expander("📦 Add/Update Stock", expanded=True):
+        with st.form("stock_form"):
+            cols = st.columns([2, 1, 1, 2])
+            with cols[0]:
+                item = st.selectbox("Item", [
+                    "Sweater", "Tracksuit", "Dress", "T-shirt",
+                    "Trousers", "Shirt", "Tie", "Socks", "Blazer", "PE Kit"
+                ])
+            with cols[1]:
+                size = st.text_input("Size", placeholder="e.g., M, 12, etc.")
+            with cols[2]:
+                quantity = st.number_input("Quantity", min_value=1, step=1)
+            with cols[3]:
+                unit_cost = st.number_input("Unit Cost (KES)", min_value=0.0, step=0.01)
+            
+            cols = st.columns(2)
+            with cols[0]:
+                supplier = st.text_input("Supplier (optional)")
+            with cols[1]:
+                invoice_no = st.text_input("Invoice No. (optional)")
+            
+            if st.form_submit_button("Update Stock"):
+                if size.strip():
+                    # Check if item exists
+                    check_query = "SELECT id FROM uniform_stock WHERE item = ? AND size = ?"
+                    exists = execute_query(conn, check_query, (item, size), fetch=True)
                     
-                    if sale_data:
-                        sale_record = sale_data[0]
-                        total_amount = sale_record[4] * sale_record[5]
-                        
-                        receipt_obj = {
-                            "receipt_id": receipt_id_input,
-                            "date": sale_record[0],
-                            "customer_name": sale_record[1] if sale_record[1] else "Walk-in Customer",
-                            "items": [{
-                                "name": sale_record[2],
-                                "size": sale_record[3],
-                                "price": sale_record[5],
-                                "quantity": sale_record[4]
-                            }],
-                            "total_amount": total_amount,
-                            "payment_mode": sale_record[6],
-                            "reference": sale_record[7],
-                            "issued_by": st.session_state.username
-                        }
-                        
-                        receipt_html = generate_receipt_html(receipt_obj)
-                        
-                        st.components.v1.html(receipt_html, height=600)
-                        st.markdown(get_receipt_download_link(receipt_html, receipt_id_input), unsafe_allow_html=True)
+                    if exists:
+                        # Update existing stock
+                        update_query = """
+                            UPDATE uniform_stock 
+                            SET quantity = quantity + ?, unit_cost = ?, supplier = ?, invoice_no = ?
+                            WHERE item = ? AND size = ?
+                        """
+                        if execute_query(conn, update_query, 
+                                       (quantity, unit_cost, supplier, invoice_no, item, size)):
+                            st.success("Stock updated successfully!")
                     else:
-                        st.error("Receipt not found in either receipts or sales records.")
+                        # Add new stock
+                        insert_query = """
+                            INSERT INTO uniform_stock (item, size, quantity, unit_cost, supplier, invoice_no)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """
+                        if execute_query(conn, insert_query, 
+                                       (item, size, quantity, unit_cost, supplier, invoice_no)):
+                            st.success("New stock item added!")
+                else:
+                    st.warning("Please enter a valid size")
 
-# --- Tab 4: Reports ---
-with tabs[3]:
-    st.subheader("📈 Financial Reports")
+    st.subheader("📊 Current Stock Levels")
+    stock = execute_query(conn, "SELECT item, size, quantity, unit_cost FROM uniform_stock ORDER BY item, size", fetch=True)
+    if stock:
+        df = pd.DataFrame(stock, columns=["Item", "Size", "Quantity", "Unit Cost"])
+        df["Total Value"] = df["Quantity"] * df["Unit Cost"]
+        
+        # Show summary
+        total_items = df["Quantity"].sum()
+        total_value = df["Total Value"].sum()
+        
+        cols = st.columns(2)
+        cols[0].metric("Total Items in Stock", f"{total_items:,}")
+        cols[1].metric("Total Stock Value", format_currency(total_value))
+        
+        st.dataframe(df, use_container_width=True)
+        st.markdown(get_download_link(df, "stock_report", "📥 Download Stock Report"), unsafe_allow_html=True)
+    else:
+        st.info("No stock items found in inventory")
+
+def show_sales_tab(conn):
+    """Uniform sales management tab"""
+    st.header("🛍 Uniform Sales")
     
-    # Date range selector for reports
-    report_col1, report_col2, report_col3 = st.columns(3)
-    with report_col1:
-        report_type = st.selectbox("Report Type", ["Expenses", "Uniform Sales", "Combined"])
-    with report_col2:
-        report_from = st.date_input("From", value=date.today().replace(day=1))
-    with report_col3:
-        report_to = st.date_input("To", value=date.today())
+    with st.expander("💳 Record New Sale", expanded=True):
+        with st.form("sales_form"):
+            cols = st.columns(3)
+            with cols[0]:
+                sale_date = st.date_input("Date", value=date.today())
+            with cols[1]:
+                student_name = st.text_input("Student Name (optional)")
+            with cols[2]:
+                student_class = st.text_input("Class/Grade (optional)")
+            
+            cols = st.columns([2, 1, 1, 2])
+            with cols[0]:
+                item = st.selectbox("Item", [
+                    "Sweater", "Tracksuit", "Dress", "T-shirt",
+                    "Trousers", "Shirt", "Tie", "Socks", "Blazer", "PE Kit"
+                ])
+            with cols[1]:
+                size = st.text_input("Size")
+            with cols[2]:
+                quantity = st.number_input("Quantity", min_value=1, step=1, value=1)
+            with cols[3]:
+                price = st.number_input("Unit Price (KES)", min_value=0.0, step=0.01)
+            
+            cols = st.columns(2)
+            with cols[0]:
+                payment_mode = st.selectbox("Payment Method", ["Cash", "M-Pesa", "Bank Transfer", "Cheque", "Other"])
+            with cols[1]:
+                reference = st.text_input("Payment Reference (optional)")
+            
+            generate_receipt = st.checkbox("Generate Receipt", value=True)
+            
+            if st.form_submit_button("Record Sale"):
+                if size.strip() and price > 0:
+                    # Check stock availability
+                    if not check_stock_availability(conn, item, size, quantity):
+                        st.error("Insufficient stock for this item!")
+                    else:
+                        # Generate receipt ID
+                        receipt_id = generate_unique_id("REC-")
+                        
+                        # Record sale
+                        sale_query = """
+                            INSERT INTO uniform_sales (
+                                date, student_name, student_class, item, size,
+                                quantity, selling_price, payment_mode, reference, receipt_id
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """
+                        sale_params = (
+                            sale_date, student_name, student_class, item, size,
+                            quantity, price, payment_mode, reference, receipt_id
+                        )
+                        
+                        if execute_query(conn, sale_query, sale_params):
+                            # Update stock
+                            update_stock(conn, item, size, -quantity)
+                            st.success("Sale recorded successfully!")
+                            
+                            # Generate receipt if requested
+                            if generate_receipt:
+                                receipt_data = {
+                                    "receipt_id": receipt_id,
+                                    "date": sale_date.strftime("%Y-%m-%d"),
+                                    "customer_name": student_name or "Walk-in Customer",
+                                    "items": [{
+                                        "name": item,
+                                        "size": size,
+                                        "price": price,
+                                        "quantity": quantity
+                                    }],
+                                    "total_amount": price * quantity,
+                                    "payment_mode": payment_mode,
+                                    "reference": reference,
+                                    "issued_by": "System"  # Replace with actual user
+                                }
+                                
+                                # Save receipt
+                                if save_receipt(conn, receipt_data):
+                                    # Show receipt
+                                    receipt_html = generate_receipt_html(receipt_data)
+                                    with st.expander("📄 View Receipt", expanded=True):
+                                        st.components.v1.html(receipt_html, height=600)
+                                        st.markdown(
+                                            f'<a href="data:text/html;base64,{base64.b64encode(receipt_html.encode()).decode()}" '
+                                            f'download="receipt_{receipt_id}.html" target="_blank">📄 Download Receipt</a>',
+                                            unsafe_allow_html=True
+                                        )
+                else:
+                    st.warning("Please complete all required fields")
+
+    st.subheader("📋 Sales Records")
+    with st.expander("Filter Sales"):
+        cols = st.columns(3)
+        with cols[0]:
+            start_date = st.date_input("From Date", value=date.today() - timedelta(days=30))
+        with cols[1]:
+            end_date = st.date_input("To Date", value=date.today())
+        with cols[2]:
+            items = st.multiselect("Items", [
+                "Sweater", "Tracksuit", "Dress", "T-shirt",
+                "Trousers", "Shirt", "Tie", "Socks", "Blazer", "PE Kit"
+            ])
         
-    if report_type == "Expenses" or report_type == "Combined":
-        st.write("### 📂 Expense Summary")
+        search_term = st.text_input("Search Student or Reference")
+
+    # Build query
+    query = """
+        SELECT date, student_name, student_class, item, size, 
+               quantity, selling_price, payment_mode, reference, receipt_id
+        FROM uniform_sales 
+        WHERE date BETWEEN ? AND ?
+    """
+    params = [start_date, end_date]
+    
+    if items:
+        query += " AND item IN (" + ",".join(["?"] * len(items)) + ")"
+        params.extend(items)
+    
+    if search_term:
+        query += " AND (student_name LIKE ? OR reference LIKE ?)"
+        params.extend([f"%{search_term}%", f"%{search_term}%"])
+    
+    query += " ORDER BY date DESC"
+    
+    sales = execute_query(conn, query, params, fetch=True)
+    if sales:
+        df = pd.DataFrame(sales, columns=[
+            "Date", "Student", "Class", "Item", "Size", 
+            "Quantity", "Price", "Payment", "Reference", "Receipt ID"
+        ])
+        df["Total"] = df["Quantity"] * df["Price"]
         
-        # Get expense data
+        # Summary stats
+        total_sales = df["Total"].sum()
+        total_items = df["Quantity"].sum()
+        
+        cols = st.columns(2)
+        cols[0].metric("Total Sales", format_currency(total_sales))
+        cols[1].metric("Items Sold", f"{total_items:,}")
+        
+        st.dataframe(df, use_container_width=True)
+        st.markdown(get_download_link(df, "sales_report", "📥 Download Sales Report"), unsafe_allow_html=True)
+    else:
+        st.info("No sales found for the selected filters")
+
+def show_reports_tab(conn):
+    """Financial reports tab"""
+    st.header("📈 Financial Reports")
+    
+    report_type = st.selectbox("Select Report Type", [
+        "Expense Summary", 
+        "Sales Summary", 
+        "Inventory Valuation",
+        "Monthly Trends"
+    ])
+    
+    if report_type == "Expense Summary":
+        st.subheader("💰 Expense Summary Report")
+        cols = st.columns(2)
+        with cols[0]:
+            start_date = st.date_input("Start Date", value=date.today().replace(day=1))
+        with cols[1]:
+            end_date = st.date_input("End Date", value=date.today())
+        
+        query = """
+            SELECT category, SUM(amount) as total 
+            FROM expenses 
+            WHERE date BETWEEN ? AND ?
+            GROUP BY category
+            ORDER BY total DESC
+        """
+        results = execute_query(conn, query, (start_date, end_date), fetch=True)
+        
+        if results:
+            df = pd.DataFrame(results, columns=["Category", "Amount"])
+            total = df["Amount"].sum()
+            
+            st.metric("Total Expenses", format_currency(total))
+            
+            cols = st.columns(2)
+            with cols[0]:
+                st.dataframe(df, use_container_width=True)
+            with cols[1]:
+                fig = px.pie(df, values="Amount", names="Category", 
+                            title="Expense Distribution")
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No expenses found for the selected period")
+    
+    elif report_type == "Sales Summary":
+        st.subheader("🛍 Sales Summary Report")
+        cols = st.columns(2)
+        with cols[0]:
+            start_date = st.date_input("Start Date", value=date.today().replace(day=1))
+        with cols[1]:
+            end_date = st.date_input("End Date", value=date.today())
+        
+        query = """
+            SELECT item, SUM(quantity) as total_qty, 
+                   SUM(quantity * selling_price) as total_value
+            FROM uniform_sales 
+            WHERE date BETWEEN ? AND ?
+            GROUP BY item
+            ORDER BY total_value DESC
+        """
+        results = execute_query(conn, query, (start_date, end_date), fetch=True)
+        
+        if results:
+            df = pd.DataFrame(results, columns=["Item", "Quantity", "Total Value"])
+            total_value = df["Total Value"].sum()
+            total_qty = df["Quantity"].sum()
+            
+            cols = st.columns(2)
+            cols[0].metric("Total Sales Value", format_currency(total_value))
+            cols[1].metric("Total Items Sold", f"{total_qty:,}")
+            
+            cols = st.columns(2)
+            with cols[0]:
+                st.dataframe(df, use_container_width=True)
+            with cols[1]:
+                fig = px.bar(df, x="Item", y="Total Value", 
+                            title="Sales by Item")
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No sales found for the selected period")
+    
+    elif report_type == "Inventory Valuation":
+        st.subheader("📦 Inventory Valuation Report")
+        
+        query = """
+            SELECT item, size, quantity, unit_cost, 
+                   (quantity * unit_cost) as total_value
+            FROM uniform_stock
+            ORDER BY total_value DESC
+        """
+        results = execute_query(conn, query, fetch=True)
+        
+        if results:
+            df = pd.DataFrame(results, columns=["Item", "Size", "Quantity", "Unit Cost", "Total Value"])
+            total_value = df["Total Value"].sum()
+            
+            st.metric("Total Inventory Value", format_currency(total_value))
+            st.dataframe(df, use_container_width=True)
+            
+            fig = px.treemap(df, path=["Item", "Size"], values="Total Value",
+                            title="Inventory Value Distribution")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No inventory items found")
+    
+    elif report_type == "Monthly Trends":
+        st.subheader("📅 Monthly Trends Analysis")
+        
+        # Get monthly expenses
         expense_query = """
-            SELECT date, category, description, amount 
-            FROM expenses WHERE date BETWEEN ? AND ?
-            ORDER BY date
+            SELECT strftime('%Y-%m', date) as month, 
+                   SUM(amount) as expenses
+            FROM expenses
+            GROUP BY month
+            ORDER BY month
         """
-        expense_data = execute_query(expense_query, [report_from, report_to], fetch=True)
+        expenses = execute_query(conn, expense_query, fetch=True)
         
-        if expense_data:
-            expense_df = pd.DataFrame(expense_data, columns=["Date", "Category", "Description", "Amount"])
-            
-            # Category summary
-            cat_summary = expense_df.groupby("Category")["Amount"].sum().reset_index()
-            
-            col1, col2 = st.columns([2, 3])
-            with col1:
-                st.dataframe(cat_summary, use_container_width=True)
-                st.metric("Total Expenses", f"KES {cat_summary['Amount'].sum():,.2f}")
-            with col2:
-                fig = px.pie(cat_summary, values="Amount", names="Category", title="Expense Distribution by Category")
-                st.plotly_chart(fig, use_container_width=True)
-            
-            st.write("#### Expense Details")
-            st.dataframe(expense_df, use_container_width=True)
-            
-            # Download buttons for expense report
-            report_download_col1, report_download_col2 = st.columns(2)
-            with report_download_col1:
-                st.markdown(get_download_link(expense_df, f"expenses_{report_from}_to_{report_to}", "📥 Download Expense Report (CSV)"), unsafe_allow_html=True)
-            with report_download_col2:
-                st.markdown(get_excel_download_link(expense_df, f"expenses_{report_from}_to_{report_to}", "📊 Download Expense Report (Excel)"), unsafe_allow_html=True)
-        else:
-            st.info("No expense data found for the selected date range.")
-            
-    if report_type == "Uniform Sales" or report_type == "Combined":
-        st.write("### 👕 Uniform Sales Summary")
-        
-        # Get sales data
+        # Get monthly sales
         sales_query = """
-            SELECT date, item, size, quantity, selling_price, payment_mode 
-            FROM uniform_sales WHERE date BETWEEN ? AND ?
-            ORDER BY date
+            SELECT strftime('%Y-%m', date) as month, 
+                   SUM(quantity * selling_price) as sales
+            FROM uniform_sales
+            GROUP BY month
+            ORDER BY month
         """
-        sales_data = execute_query(sales_query, [report_from, report_to], fetch=True)
+        sales = execute_query(conn, sales_query, fetch=True)
         
-        if sales_data:
-            sales_df = pd.DataFrame(sales_data, columns=["Date", "Item", "Size", "Quantity", "Price", "Payment Mode"])
-            sales_df["Total"] = sales_df["Quantity"] * sales_df["Price"]
+        # Create DataFrames
+        expense_df = pd.DataFrame(expenses or [], columns=["Month", "Expenses"])
+        sales_df = pd.DataFrame(sales or [], columns=["Month", "Sales"])
+        
+        # Merge data
+        if not expense_df.empty or not sales_df.empty:
+            df = pd.merge(expense_df, sales_df, on="Month", how="outer").fillna(0)
             
-            # Item summary
-            item_summary = sales_df.groupby("Item")["Total"].sum().reset_index()
+            # Calculate profit
+            df["Profit"] = df["Sales"] - df["Expenses"]
             
-            col1, col2 = st.columns([2, 3])
-            with col1:
-                st.dataframe(item_summary, use_container_width=True)
-                st.metric("Total Sales", f"KES {item_summary['Total'].sum():,.2f}")
-            with col2:
-                fig = px.pie(item_summary, values="Total", names="Item", title="Sales Distribution by Item")
-                st.plotly_chart(fig, use_container_width=True)
+            # Show metrics
+            latest = df.iloc[-1] if not df.empty else None
+            if latest is not None:
+                cols = st.columns(3)
+                cols[0].metric("Latest Month", latest["Month"])
+                cols[1].metric("Expenses", format_currency(latest["Expenses"]))
+                cols[2].metric("Sales", format_currency(latest["Sales"]))
+                
+                if len(df) > 1:
+                    prev = df.iloc[-2]
+                    delta_exp = latest["Expenses"] - prev["Expenses"]
+                    delta_sales = latest["Sales"] - prev["Sales"]
+                    
+                    cols = st.columns(2)
+                    cols[0].metric("Expenses Change", format_currency(delta_exp))
+                    cols[1].metric("Sales Change", format_currency(delta_sales))
             
-            st.write("#### Sales Details")
-            st.dataframe(sales_df, use_container_width=True)
+            # Show trend chart
+            fig = px.line(df, x="Month", y=["Expenses", "Sales", "Profit"],
+                         title="Monthly Financial Trends",
+                         labels={"value": "Amount (KES)", "variable": "Category"})
+            st.plotly_chart(fig, use_container_width=True)
             
-            # Download buttons for sales report
-            report_download_col1, report_download_col2 = st.columns(2)
-            with report_download_col1:
-                st.markdown(get_download_link(sales_df, f"sales_{report_from}_to_{report_to}", "📥 Download Sales Report (CSV)"), unsafe_allow_html=True)
-            with report_download_col2:
-                st.markdown(get_excel_download_link(sales_df, f"sales_{report_from}_to_{report_to}", "📊 Download Sales Report (Excel)"), unsafe_allow_html=True)
+            st.dataframe(df, use_container_width=True)
         else:
-            st.info("No sales data found for the selected date range.")
+            st.info("No financial data available for trend analysis")
 
-# --- Tab 5: Dashboard ---
-with tabs[4]:
-    st.subheader("📊 Financial Dashboard")
-    
-    # Get data for dashboard
-    today = date.today()
-    first_day = today.replace(day=1)
-    last_month = first_day - timedelta(days=1)
-    first_day_last_month = last_month.replace(day=1)
+def show_dashboard(conn):
+    """Main dashboard view"""
+    st.header("📊 Financial Dashboard")
     
     # Current month metrics
-    current_month_expenses = execute_query(
-        "SELECT SUM(amount) FROM expenses WHERE date BETWEEN ? AND ?",
-        [first_day, today], fetch=True
-    )
-    current_month_sales = execute_query(
-        "SELECT SUM(quantity * selling_price) FROM uniform_sales WHERE date BETWEEN ? AND ?",
-        [first_day, today], fetch=True
-    )
+    today = date.today()
+    first_day = today.replace(day=1)
     
-    # Last month metrics
-    last_month_expenses = execute_query(
-        "SELECT SUM(amount) FROM expenses WHERE date BETWEEN ? AND ?",
-        [first_day_last_month, last_month], fetch=True
-    )
-    last_month_sales = execute_query(
-        "SELECT SUM(quantity * selling_price) FROM uniform_sales WHERE date BETWEEN ? AND ?",
-        [first_day_last_month, last_month], fetch=True
-    )
+    # Expense metrics
+    expense_query = """
+        SELECT SUM(amount) FROM expenses 
+        WHERE date BETWEEN ? AND ?
+    """
+    current_expenses = execute_query(conn, expense_query, (first_day, today), fetch=True)
+    current_expenses = current_expenses[0][0] if current_expenses and current_expenses[0][0] else 0
+    
+    # Sales metrics
+    sales_query = """
+        SELECT SUM(quantity * selling_price) FROM uniform_sales 
+        WHERE date BETWEEN ? AND ?
+    """
+    current_sales = execute_query(conn, sales_query, (first_day, today), fetch=True)
+    current_sales = current_sales[0][0] if current_sales and current_sales[0][0] else 0
+    
+    # Inventory metrics
+    inventory_query = "SELECT SUM(quantity * unit_cost) FROM uniform_stock"
+    inventory_value = execute_query(conn, inventory_query, fetch=True)
+    inventory_value = inventory_value[0][0] if inventory_value and inventory_value[0][0] else 0
     
     # Display metrics
-    col1, col2 = st.columns(2)
-    with col1:
-        if current_month_expenses and current_month_expenses[0][0]:
-            delta = None
-            if last_month_expenses and last_month_expenses[0][0]:
-                delta = current_month_expenses[0][0] - last_month_expenses[0][0]
-            st.metric("Current Month Expenses", f"KES {current_month_expenses[0][0]:,.2f}", delta=f"KES {delta:,.2f}" if delta else None)
+    cols = st.columns(3)
+    cols[0].metric("Current Month Expenses", format_currency(current_expenses))
+    cols[1].metric("Current Month Sales", format_currency(current_sales))
+    cols[2].metric("Inventory Value", format_currency(inventory_value))
+    
+    # Recent transactions
+    st.subheader("Recent Activity")
+    
+    cols = st.columns(2)
+    with cols[0]:
+        st.markdown("**Last 5 Expenses**")
+        expenses = execute_query(conn, """
+            SELECT date, category, description, amount 
+            FROM expenses ORDER BY date DESC LIMIT 5
+        """, fetch=True)
+        if expenses:
+            st.dataframe(pd.DataFrame(expenses, columns=["Date", "Category", "Description", "Amount"]), 
+                        use_container_width=True)
         else:
-            st.metric("Current Month Expenses", "KES 0.00")
+            st.info("No recent expenses")
     
-    with col2:
-        if current_month_sales and current_month_sales[0][0]:
-            delta = None
-            if last_month_sales and last_month_sales[0][0]:
-                delta = current_month_sales[0][0] - last_month_sales[0][0]
-            st.metric("Current Month Sales", f"KES {current_month_sales[0][0]:,.2f}", delta=f"KES {delta:,.2f}" if delta else None)
+    with cols[1]:
+        st.markdown("**Last 5 Sales**")
+        sales = execute_query(conn, """
+            SELECT date, student_name, item, quantity, selling_price 
+            FROM uniform_sales ORDER BY date DESC LIMIT 5
+        """, fetch=True)
+        if sales:
+            st.dataframe(pd.DataFrame(sales, columns=["Date", "Student", "Item", "Qty", "Price"]), 
+                        use_container_width=True)
         else:
-            st.metric("Current Month Sales", "KES 0.00")
-    
-    # Expense trends chart
-    st.write("### 📅 Monthly Trends")
-    
-    # Get monthly data for the last 12 months
-    twelve_months_ago = today - timedelta(days=365)
-    
-    monthly_expenses = execute_query(
-        """SELECT strftime('%Y-%m', date) as month, SUM(amount) 
-           FROM expenses WHERE date BETWEEN ? AND ?
-           GROUP BY strftime('%Y-%m', date) ORDER BY month""",
-        [twelve_months_ago, today], fetch=True
-    )
-    
-    monthly_sales = execute_query(
-        """SELECT strftime('%Y-%m', date) as month, SUM(quantity * selling_price) 
-           FROM uniform_sales WHERE date BETWEEN ? AND ?
-           GROUP BY strftime('%Y-%m', date) ORDER BY month""",
-        [twelve_months_ago, today], fetch=True
-    )
-    
-    # Create DataFrames
-    if monthly_expenses:
-        expenses_df = pd.DataFrame(monthly_expenses, columns=["Month", "Expenses"])
-    else:
-        expenses_df = pd.DataFrame(columns=["Month", "Expenses"])
-    
-    if monthly_sales:
-        sales_df = pd.DataFrame(monthly_sales, columns=["Month", "Sales"])
-    else:
-        sales_df = pd.DataFrame(columns=["Month", "Sales"])
-    
-    # Merge data
-    trend_df = pd.merge(expenses_df, sales_df, on="Month", how="outer").fillna(0)
-    
-    # Plot trends
-    if not trend_df.empty:
-        fig = px.line(trend_df, x="Month", y=["Expenses", "Sales"], 
-                      title="Monthly Expenses vs Sales",
-                      labels={"value": "Amount (KES)", "variable": "Category"})
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No data available for trends analysis.")
+            st.info("No recent sales")
 
-# --- Tab 6: Settings ---
-with tabs[5]:
-    st.subheader("⚙️ Application Settings")
+def show_settings(conn):
+    """Application settings tab"""
+    st.header("⚙️ Settings")
     
-    if st.session_state.username == "admin":
-        st.write("### Database Management")
+    if st.session_state.get("username") == "admin":
+        st.subheader("Database Management")
         
-        col1, col2 = st.columns(2)
-        with col1:
+        cols = st.columns(2)
+        with cols[0]:
             if st.button("Export Database Backup"):
-                # Create a backup of the SQLite database
-                conn = get_connection()
-                with io.BytesIO() as f:
-                    for line in conn.iterdump():
-                        f.write(f"{line}\n".encode('utf-8'))
-                    f.seek(0)
-                    st.download_button(
-                        label="Download Database Backup",
-                        data=f,
-                        file_name=f"school_expenses_backup_{today}.sql",
-                        mime="application/sql"
-                    )
+                try:
+                    with io.BytesIO() as f:
+                        for line in conn.iterdump():
+                            f.write(f"{line}\n".encode('utf-8'))
+                        f.seek(0)
+                        st.download_button(
+                            label="Download Backup",
+                            data=f,
+                            file_name=f"school_expenses_backup_{date.today()}.sql",
+                            mime="application/sql"
+                        )
+                except Exception as e:
+                    st.error(f"Backup failed: {str(e)}")
         
-        with col2:
-            if st.button("Reset All Data (DANGER)"):
+        with cols[1]:
+            if st.button("Reset All Data", type="secondary"):
                 st.warning("This will delete ALL data in the database!")
                 if st.checkbox("I understand this cannot be undone"):
-                    if st.button("Confirm Reset"):
-                        execute_query("DELETE FROM expenses")
-                        execute_query("DELETE FROM uniform_stock")
-                        execute_query("DELETE FROM uniform_sales")
-                        execute_query("DELETE FROM receipts")
+                    if st.button("Confirm Reset", type="primary"):
+                        execute_query(conn, "DELETE FROM expenses")
+                        execute_query(conn, "DELETE FROM uniform_stock")
+                        execute_query(conn, "DELETE FROM uniform_sales")
+                        execute_query(conn, "DELETE FROM receipts")
                         st.success("Database has been reset")
     else:
         st.warning("Only admin users can access these settings")
     
-    st.write("### About")
+    st.subheader("About")
     st.write("""
     **School Expense and Uniform Tracker**  
-    Version 1.0  
+    Version 2.0  
     Developed for Success Achievers School  
-    © 2025 All Rights Reserved
+    © 2023 All Rights Reserved
     """)
+
+# ======================
+# MAIN APPLICATION
+# ======================
+def main():
+    """Main application function"""
+    # Initialize session state
+    if 'logged_in' not in st.session_state:
+        st.session_state.logged_in = False
+    if 'username' not in st.session_state:
+        st.session_state.username = ""
+    
+    # Simple login - replace with your actual authentication
+    if not st.session_state.logged_in:
+        with st.form("login_form"):
+            st.title("School Expense Tracker Login")
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            
+            if st.form_submit_button("Login"):
+                # Simple demo authentication - replace with real auth
+                if username == "admin" and password == "admin123":
+                    st.session_state.logged_in = True
+                    st.session_state.username = username
+                    st.rerun()
+                else:
+                    st.error("Invalid credentials")
+        return
+    
+    # Get database connection
+    conn = get_db_connection()
+    
+    # Sidebar navigation
+    with st.sidebar:
+        st.title(f"Welcome, {st.session_state.username}")
+        st.divider()
+        
+        # Quick stats
+        total_expenses = execute_query(conn, "SELECT SUM(amount) FROM expenses", fetch=True)
+        total_sales = execute_query(conn, "SELECT SUM(quantity * selling_price) FROM uniform_sales", fetch=True)
+        
+        if total_expenses and total_expenses[0][0]:
+            st.metric("Total Expenses", format_currency(total_expenses[0][0]))
+        if total_sales and total_sales[0][0]:
+            st.metric("Total Sales", format_currency(total_sales[0][0]))
+        
+        st.divider()
+        
+        # Navigation
+        app_page = st.radio("Navigation", [
+            "Dashboard", "Expenses", "Uniform Stock", 
+            "Uniform Sales", "Reports", "Settings"
+        ])
+        
+        if st.button("Logout"):
+            st.session_state.logged_in = False
+            st.session_state.username = ""
+            st.rerun()
+    
+    # Main content area
+    if app_page == "Dashboard":
+        show_dashboard(conn)
+    elif app_page == "Expenses":
+        show_expenses_tab(conn)
+    elif app_page == "Uniform Stock":
+        show_stock_tab(conn)
+    elif app_page == "Uniform Sales":
+        show_sales_tab(conn)
+    elif app_page == "Reports":
+        show_reports_tab(conn)
+    elif app_page == "Settings":
+        show_settings(conn)
+
+if __name__ == "__main__":
+    main()
