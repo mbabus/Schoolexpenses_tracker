@@ -307,7 +307,7 @@ def show_expenses_tab(conn):
         with cols[2]:
             categories = st.multiselect("Categories", [
                 "Stationery", "Food", "Fuel", "Maintenance",
-                "Salaries", "Utilities", "Transport", "Events", "Other"
+                "Salaries", "Utilities", "Transport", "Events","Mechanic", "Other"
             ])
         
         search_term = st.text_input("Search Description")
