@@ -278,7 +278,7 @@ def show_expenses_tab(conn):
             with cols[1]:
                 category = st.selectbox("Category", [
                     "Stationery", "Food", "Fuel", "Maintenance",
-                    "Salaries", "Utilities", "Transport", "Events", "Other"
+                    "Salaries", "Utilities", "Transport", "Events","Mechanic", "Other"
                 ])
             with cols[2]:
                 amount = st.number_input("Amount (KES)", min_value=0.0, step=0.01)
