@@ -26,12 +26,18 @@ st.set_page_config(
 def init_database_supabase():
     """Initialize the database with required tables in Supabase (PostgreSQL)"""
     try:
+        # Updated connection with SSL and proper Supabase settings
         conn = psycopg2.connect(
             host=st.secrets.postgres.host,
             port=st.secrets.postgres.port,
             dbname=st.secrets.postgres.dbname,
             user=st.secrets.postgres.user,
-            password=st.secrets.postgres.password
+            password=st.secrets.postgres.password,
+            sslmode='require',  # Required for Supabase
+            connect_timeout=10,  # Add timeout
+            keepalives_idle=600,
+            keepalives_interval=30,
+            keepalives_count=3
         )
         cursor = conn.cursor()
 
@@ -102,16 +108,121 @@ def init_database_supabase():
             cursor.execute("ALTER TABLE uniform_sales ADD COLUMN receipt_id VARCHAR(255)")
 
         conn.commit()
+        cursor.close()
+        return conn
+    except psycopg2.OperationalError as e:
+        st.error(f"Database connection failed: {str(e)}")
+        st.error("Please check your Supabase connection settings and ensure:")
+        st.error("1. Your Supabase project is active")
+        st.error("2. Database credentials are correct")
+        st.error("3. Your IP is whitelisted (if IP restrictions are enabled)")
+        st.error("4. SSL is properly configured")
+        st.code(traceback.format_exc())
+        return None
+    except Exception as e:
+        st.error(f"Failed to initialize Supabase database: {str(e)}")
+        st.code(traceback.format_exc())
+        return None
+
+# Alternative connection method using connection string
+def init_database_supabase_alt():
+    """Alternative connection method using full connection string"""
+    try:
+        # Construct connection string - replace [YOUR-PASSWORD] with actual password
+        conn_string = f"postgresql://{st.secrets.postgres.user}:{st.secrets.postgres.password}@{st.secrets.postgres.host}:{st.secrets.postgres.port}/{st.secrets.postgres.dbname}?sslmode=require"
+        
+        conn = psycopg2.connect(conn_string)
+        cursor = conn.cursor()
+
+        # Test connection
+        cursor.execute("SELECT version()")
+        version = cursor.fetchone()
+        st.success(f"Connected to PostgreSQL: {version[0]}")
+
+        # Create tables (same as above)
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS expenses (
+            id SERIAL PRIMARY KEY,
+            date DATE NOT NULL,
+            category VARCHAR(255) NOT NULL,
+            description TEXT,
+            amount NUMERIC(10, 2) NOT NULL,
+            receipt_no VARCHAR(255)
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS uniform_stock (
+            id SERIAL PRIMARY KEY,
+            item VARCHAR(255) NOT NULL,
+            size VARCHAR(50) NOT NULL,
+            quantity INTEGER NOT NULL,
+            unit_cost NUMERIC(10, 2) NOT NULL,
+            supplier VARCHAR(255),
+            invoice_no VARCHAR(255),
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS uniform_sales (
+            id SERIAL PRIMARY KEY,
+            date DATE NOT NULL,
+            student_name VARCHAR(255),
+            student_class VARCHAR(100),
+            item VARCHAR(255) NOT NULL,
+            size VARCHAR(50) NOT NULL,
+            quantity INTEGER NOT NULL,
+            selling_price NUMERIC(10, 2) NOT NULL,
+            payment_mode VARCHAR(100) NOT NULL,
+            reference VARCHAR(255),
+            receipt_id VARCHAR(255) UNIQUE
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS receipts (
+            id SERIAL PRIMARY KEY,
+            receipt_id VARCHAR(255) UNIQUE NOT NULL,
+            date DATE NOT NULL,
+            customer_name VARCHAR(255),
+            items_json TEXT NOT NULL,
+            total_amount NUMERIC(10, 2) NOT NULL,
+            payment_mode VARCHAR(100) NOT NULL,
+            reference VARCHAR(255),
+            issued_by VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+
+        # Add receipt_id column to uniform_sales if it doesn't exist
+        cursor.execute("""
+            SELECT 1 FROM information_schema.columns 
+            WHERE table_name='uniform_sales' AND column_name='receipt_id'
+        """)
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE uniform_sales ADD COLUMN receipt_id VARCHAR(255)")
+
+        conn.commit()
+        cursor.close()
         return conn
     except Exception as e:
-        st.error(f"Failed to connect to or initialize Supabase database: {str(e)}")
+        st.error(f"Alternative connection method failed: {str(e)}")
         st.code(traceback.format_exc())
         return None
 
 @st.cache_resource
 def get_db_connection():
     """Get a cached database connection for Supabase"""
-    return init_database_supabase()
+    # Try primary connection method first
+    conn = init_database_supabase()
+    
+    # If primary fails, try alternative method
+    if conn is None:
+        st.warning("Primary connection failed, trying alternative method...")
+        conn = init_database_supabase_alt()
+    
+    return conn
 
 def execute_query(_conn, query, params=None, fetch=False):
     """Execute a SQL query with error handling for PostgreSQL"""
