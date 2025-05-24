@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import psycopg2
+from psycopg2.extras import RealDictCursor
 import traceback
 from datetime import date, datetime, timedelta
 import plotly.express as px
@@ -8,7 +9,9 @@ import io
 import base64
 import uuid
 import json
-import hashlib # For future password hashing
+import hashlib
+import os
+from urllib.parse import urlparse
 
 # ======================
 # APP CONFIGURATION
@@ -23,146 +26,139 @@ st.set_page_config(
 # ======================
 # DATABASE FUNCTIONS
 # ======================
-# Replace your existing database connection functions with these:
 
-def init_database_supabase():
-    """Initialize the database with required tables in Supabase (PostgreSQL)"""
+def get_database_url():
+    """Get database URL from environment variables or Streamlit secrets"""
+    # Try Railway environment variable first
+    if "DATABASE_URL" in os.environ:
+        return os.environ["DATABASE_URL"]
+    
+    # Try Railway-style private URL
+    if "DATABASE_PRIVATE_URL" in os.environ:
+        return os.environ["DATABASE_PRIVATE_URL"]
+    
+    # Fallback to Streamlit secrets
     try:
-        # Simplified connection with better error handling
+        if hasattr(st, 'secrets') and 'database' in st.secrets:
+            # Railway-style connection string in secrets
+            if 'url' in st.secrets.database:
+                return st.secrets.database.url
+        
+        # Legacy Supabase format
+        if hasattr(st, 'secrets') and 'postgres' in st.secrets:
+            host = st.secrets.postgres.host
+            port = st.secrets.postgres.port
+            dbname = st.secrets.postgres.dbname
+            user = st.secrets.postgres.user
+            password = st.secrets.postgres.password
+            return f"postgresql://{user}:{password}@{host}:{port}/{dbname}?sslmode=require"
+            
+    except Exception as e:
+        st.error(f"Error reading secrets: {e}")
+    
+    return None
+
+def execute_query(conn, query, params=None, fetch=False):
+    """Execute database query with better error handling"""
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(query, params)
+            
+            if fetch:
+                return cursor.fetchall()
+            else:
+                conn.commit()
+                return True
+                
+    except psycopg2.Error as e:
+        conn.rollback()
+        st.error(f"Database error: {e}")
+        return False if not fetch else None
+    except Exception as e:
+        conn.rollback()
+        st.error(f"Unexpected error: {e}")
+        return False if not fetch else None
+
+def init_database():
+    """Initialize database with required tables"""
+    try:
+        database_url = get_database_url()
+        if not database_url:
+            st.error("❌ No database configuration found!")
+            st.info("""
+            **For Railway deployment:**
+            1. Add PostgreSQL service to your Railway project
+            2. Railway will automatically provide DATABASE_URL environment variable
+            
+            **For local development:**
+            Add database URL to .streamlit/secrets.toml:
+            ```
+            [database]
+            url = "postgresql://user:password@host:port/dbname"
+            ```
+            """)
+            return None
+            
+        # Parse URL to show connection info (without password)
+        parsed = urlparse(database_url)
+        st.success(f"🚀 Connecting to PostgreSQL: {parsed.hostname}:{parsed.port}")
+        
+        # Connect to database
         conn = psycopg2.connect(
-            host=st.secrets.postgres.host,
-            port=st.secrets.postgres.port,
-            dbname=st.secrets.postgres.dbname,
-            user=st.secrets.postgres.user,
-            password=st.secrets.postgres.password,
+            database_url,
             sslmode='require',
-            connect_timeout=30,  # Increased timeout
-            application_name='school_expense_tracker'  # Add app name for debugging
+            connect_timeout=30,
+            application_name='school_expense_tracker'
         )
         
         # Test connection
-        cursor = conn.cursor()
-        cursor.execute("SELECT version()")
-        version = cursor.fetchone()
-        st.success(f"✅ Connected to Supabase PostgreSQL")
-        
-        # Create tables if they don't exist
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS expenses (
-            id SERIAL PRIMARY KEY,
-            date DATE NOT NULL,
-            category VARCHAR(255) NOT NULL,
-            description TEXT,
-            amount NUMERIC(10, 2) NOT NULL,
-            receipt_no VARCHAR(255)
-        )
-        ''')
-
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS uniform_stock (
-            id SERIAL PRIMARY KEY,
-            item VARCHAR(255) NOT NULL,
-            size VARCHAR(50) NOT NULL,
-            quantity INTEGER NOT NULL,
-            unit_cost NUMERIC(10, 2) NOT NULL,
-            supplier VARCHAR(255),
-            invoice_no VARCHAR(255),
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS uniform_sales (
-            id SERIAL PRIMARY KEY,
-            date DATE NOT NULL,
-            student_name VARCHAR(255),
-            student_class VARCHAR(100),
-            item VARCHAR(255) NOT NULL,
-            size VARCHAR(50) NOT NULL,
-            quantity INTEGER NOT NULL,
-            selling_price NUMERIC(10, 2) NOT NULL,
-            payment_mode VARCHAR(100) NOT NULL,
-            reference VARCHAR(255),
-            receipt_id VARCHAR(255) UNIQUE
-        )
-        ''')
-
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS receipts (
-            id SERIAL PRIMARY KEY,
-            receipt_id VARCHAR(255) UNIQUE NOT NULL,
-            date DATE NOT NULL,
-            customer_name VARCHAR(255),
-            items_json TEXT NOT NULL,
-            total_amount NUMERIC(10, 2) NOT NULL,
-            payment_mode VARCHAR(100) NOT NULL,
-            reference VARCHAR(255),
-            issued_by VARCHAR(255) NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-
-        # Add receipt_id column to uniform_sales if it doesn't exist
-        cursor.execute("""
-            SELECT 1 FROM information_schema.columns 
-            WHERE table_name='uniform_sales' AND column_name='receipt_id'
-        """)
-        if not cursor.fetchone():
-            cursor.execute("ALTER TABLE uniform_sales ADD COLUMN receipt_id VARCHAR(255)")
-
-        conn.commit()
-        cursor.close()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT version()")
+            version = cursor.fetchone()[0]
+            st.success(f"✅ Connected successfully!")
+            
+        # Create tables
+        create_tables(conn)
         return conn
         
     except psycopg2.OperationalError as e:
-        error_msg = str(e)
         st.error("🚨 **Database Connection Failed**")
+        error_msg = str(e).lower()
         
-        if "Cannot assign requested address" in error_msg:
-            st.error("**Network connectivity issue detected.** This usually means:")
+        if "could not connect" in error_msg:
+            st.error("**Cannot reach database server.** Check:")
             st.markdown("""
-            - Streamlit Cloud cannot reach your Supabase instance
-            - Your Supabase project might be paused/inactive
-            - Network restrictions between Streamlit Cloud and Supabase
+            - PostgreSQL service is running
+            - DATABASE_URL environment variable is set correctly
+            - Network connectivity
             """)
         elif "authentication failed" in error_msg:
-            st.error("**Authentication failed.** Check your credentials in Streamlit secrets.")
+            st.error("**Authentication failed.** Check database credentials.")
         else:
-            st.error(f"**Connection error:** {error_msg}")
+            st.error(f"**Connection error:** {e}")
             
         return None
         
     except Exception as e:
-        st.error(f"**Unexpected error:** {str(e)}")
+        st.error(f"**Unexpected error:** {e}")
+        st.code(traceback.format_exc())
         return None
 
-def init_database_supabase_alt():
-    """Alternative connection method using connection URI"""
-    try:
-        # Fix the connection string format
-        conn_string = f"postgresql://{st.secrets.postgres.user}:{st.secrets.postgres.password}@{st.secrets.postgres.host}:{st.secrets.postgres.port}/{st.secrets.postgres.dbname}?sslmode=require&connect_timeout=30"
-        
-        conn = psycopg2.connect(conn_string)
-        cursor = conn.cursor()
-
-        # Test connection
-        cursor.execute("SELECT version()")
-        version = cursor.fetchone()
-        st.success(f"✅ Alternative connection successful")
-
-        # Create tables (same as above)
-        cursor.execute('''
+def create_tables(conn):
+    """Create all required database tables"""
+    tables = [
+        '''
         CREATE TABLE IF NOT EXISTS expenses (
             id SERIAL PRIMARY KEY,
             date DATE NOT NULL,
             category VARCHAR(255) NOT NULL,
             description TEXT,
             amount NUMERIC(10, 2) NOT NULL,
-            receipt_no VARCHAR(255)
+            receipt_no VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        ''')
-
-        cursor.execute('''
+        ''',
+        '''
         CREATE TABLE IF NOT EXISTS uniform_stock (
             id SERIAL PRIMARY KEY,
             item VARCHAR(255) NOT NULL,
@@ -173,9 +169,8 @@ def init_database_supabase_alt():
             invoice_no VARCHAR(255),
             last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        ''')
-
-        cursor.execute('''
+        ''',
+        '''
         CREATE TABLE IF NOT EXISTS uniform_sales (
             id SERIAL PRIMARY KEY,
             date DATE NOT NULL,
@@ -187,11 +182,11 @@ def init_database_supabase_alt():
             selling_price NUMERIC(10, 2) NOT NULL,
             payment_mode VARCHAR(100) NOT NULL,
             reference VARCHAR(255),
-            receipt_id VARCHAR(255) UNIQUE
+            receipt_id VARCHAR(255) UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        ''')
-
-        cursor.execute('''
+        ''',
+        '''
         CREATE TABLE IF NOT EXISTS receipts (
             id SERIAL PRIMARY KEY,
             receipt_id VARCHAR(255) UNIQUE NOT NULL,
@@ -204,105 +199,36 @@ def init_database_supabase_alt():
             issued_by VARCHAR(255) NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        ''')
-
-        # Add receipt_id column to uniform_sales if it doesn't exist
-        cursor.execute("""
-            SELECT 1 FROM information_schema.columns 
-            WHERE table_name='uniform_sales' AND column_name='receipt_id'
-        """)
-        if not cursor.fetchone():
-            cursor.execute("ALTER TABLE uniform_sales ADD COLUMN receipt_id VARCHAR(255)")
-
-        conn.commit()
-        cursor.close()
-        return conn
-        
-    except Exception as e:
-        st.error(f"**Alternative connection failed:** {str(e)}")
-        return None
-
-# Add this new function for troubleshooting
-def test_supabase_connection():
-    """Test Supabase connection and show detailed diagnostics"""
-    st.subheader("🔧 Connection Diagnostics")
+        '''
+    ]
     
     try:
-        # Show connection parameters (without password)
-        st.info(f"""
-        **Connection Parameters:**
-        - Host: {st.secrets.postgres.host}
-        - Port: {st.secrets.postgres.port}
-        - Database: {st.secrets.postgres.dbname}
-        - User: {st.secrets.postgres.user}
-        """)
-        
-        # Try ping first
-        import socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        result = sock.connect_ex((st.secrets.postgres.host, int(st.secrets.postgres.port)))
-        sock.close()
-        
-        if result == 0:
-            st.success("✅ Network connectivity to Supabase host is working")
-        else:
-            st.error("❌ Cannot reach Supabase host - network connectivity issue")
-            return False
+        with conn.cursor() as cursor:
+            for table_sql in tables:
+                cursor.execute(table_sql)
             
+            # Add indexes for better performance
+            indexes = [
+                "CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date)",
+                "CREATE INDEX IF NOT EXISTS idx_sales_date ON uniform_sales(date)",
+                "CREATE INDEX IF NOT EXISTS idx_stock_item_size ON uniform_stock(item, size)",
+                "CREATE INDEX IF NOT EXISTS idx_receipts_date ON receipts(date)"
+            ]
+            
+            for index_sql in indexes:
+                cursor.execute(index_sql)
+                
+        conn.commit()
+        st.success("📊 Database tables initialized successfully!")
+        
     except Exception as e:
-        st.error(f"Network test failed: {str(e)}")
-        return False
-    
-    return True
+        st.error(f"Failed to create tables: {e}")
+        conn.rollback()
 
 @st.cache_resource
 def get_db_connection():
-    """Get a cached database connection for Supabase with better error handling"""
-    
-    # First run connection diagnostics
-    if not test_supabase_connection():
-        st.error("**Network connectivity issue detected. Possible solutions:**")
-        st.markdown("""
-        1. **Check Supabase Project Status:** 
-           - Go to your Supabase dashboard
-           - Ensure your project is active (not paused)
-           
-        2. **Verify Connection Details:**
-           - Double-check your connection string in Supabase settings
-           - Ensure all credentials in Streamlit secrets are correct
-           
-        3. **Alternative Deployment Options:**
-           - **Render.com** (free tier with PostgreSQL support)
-           - **Railway.app** (good PostgreSQL integration)
-           - **Heroku** (with Heroku Postgres addon)
-        """)
-        return None
-    
-    # Try primary connection method first
-    conn = init_database_supabase()
-    
-    # If primary fails, try alternative method
-    if conn is None:
-        st.warning("⚠️ Primary connection failed, trying alternative method...")
-        conn = init_database_supabase_alt()
-    
-    if conn is None:
-        st.error("❌ **Both connection methods failed.**")
-        st.markdown("""
-        ### 🚀 **Recommended Solution: Switch to Railway**
-        
-        Railway.app offers excellent PostgreSQL support and is more reliable for Streamlit apps:
-        
-        1. **Create a Railway account** at railway.app
-        2. **Deploy a PostgreSQL database** (free tier available)
-        3. **Update your Streamlit secrets** with Railway connection details
-        4. **Redeploy your app**
-        
-        Railway typically has better network compatibility with Streamlit Cloud.
-        """)
-    
-    return conn
+    """Get cached database connection"""
+    return init_database()
 
 # ======================
 # UTILITY FUNCTIONS
@@ -313,7 +239,9 @@ def generate_unique_id(prefix=""):
 
 def format_currency(amount):
     """Format amount as currency"""
-    return f"KES {amount:,.2f}"
+    if amount is None:
+        return "KES 0.00"
+    return f"KES {float(amount):,.2f}"
 
 def get_download_link(df, filename, text):
     """Generate a CSV download link"""
@@ -480,7 +408,7 @@ def show_expenses_tab(conn):
                     """
                     if execute_query(conn, query, (exp_date, category, description, amount, receipt_no)):
                         st.success("Expense recorded successfully!")
-                        st.rerun() # Rerun to clear form and update data
+                        st.rerun()
                 else:
                     st.warning("Please enter a valid amount and description")
 
@@ -508,7 +436,7 @@ def show_expenses_tab(conn):
         params.extend(categories)
 
     if search_term:
-        query += " AND description ILIKE %s" # ILIKE for case-insensitive search in PostgreSQL
+        query += " AND description ILIKE %s"
         params.append(f"%{search_term}%")
 
     query += " ORDER BY date DESC"
@@ -676,10 +604,10 @@ def show_sales_tab(conn):
                                         "price": price,
                                         "quantity": quantity
                                     }],
-                                    "total_amount": float(price * quantity), # Ensure float for JSON
+                                    "total_amount": float(price * quantity),
                                     "payment_mode": payment_mode,
                                     "reference": reference,
-                                    "issued_by": st.session_state.username # Use logged-in user
+                                    "issued_by": st.session_state.get("username", "System")
                                 }
 
                                 # Save receipt
@@ -692,10 +620,10 @@ def show_sales_tab(conn):
                                         # Download button for HTML receipt
                                         st.markdown(
                                             f'<a href="data:text/html;base64,{base64.b64encode(receipt_html.encode()).decode()}" '
-                                            f'download="receipt_{receipt_id}.html" target="_blank" class="st-emotion-cache-l9bibl effi0qh1">📄 Download Receipt HTML</a>',
+                                            f'download="receipt_{receipt_id}.html" target="_blank">📄 Download Receipt HTML</a>',
                                             unsafe_allow_html=True
                                         )
-                            st.rerun() # Rerun to clear form and update data
+                            st.rerun()
                 else:
                     st.warning("Please ensure Size, Quantity, and Unit Price are valid and entered.")
 
@@ -728,7 +656,7 @@ def show_sales_tab(conn):
         params.extend(items)
 
     if search_term:
-        query += " AND (student_name ILIKE %s OR reference ILIKE %s)" # ILIKE for case-insensitive
+        query += " AND (student_name ILIKE %s OR reference ILIKE %s)"
         params.extend([f"%{search_term}%", f"%{search_term}%"])
 
     query += " ORDER BY date DESC"
@@ -796,8 +724,7 @@ def show_reports_tab(conn):
                 fig = px.pie(df, values="Amount", names="Category",
                             title="Expense Distribution")
                 st.plotly_chart(fig, use_container_width=True)
-            st.markdown(get_download_link(df, "expense_summary", "📥 Download Expense Summary CSV"), unsafe_allow_html=True)
-            st.markdown(get_excel_link(df, "expense_summary", "📊 Download Expense Summary Excel"), unsafe_allow_html=True)
+            st.markdown(get_download_link(df, "expense_summary", "📥 Download CSV"), unsafe_allow_html=True)
         else:
             st.info("No expenses found for the selected period")
 
@@ -810,311 +737,351 @@ def show_reports_tab(conn):
             end_date = st.date_input("End Date", value=date.today())
 
         query = """
-            SELECT item, SUM(quantity) as total_qty,
-                   SUM(quantity * selling_price) as total_value
+            SELECT item, SUM(quantity) as total_qty, SUM(quantity * selling_price) as total_sales
             FROM uniform_sales
             WHERE date BETWEEN %s AND %s
             GROUP BY item
-            ORDER BY total_value DESC
+            ORDER BY total_sales DESC
         """
         results = execute_query(conn, query, (start_date, end_date), fetch=True)
 
         if results:
-            df = pd.DataFrame(results, columns=["Item", "Quantity", "Total Value"])
-            total_value = df["Total Value"].sum()
-            total_qty = df["Quantity"].sum()
+            df = pd.DataFrame(results, columns=["Item", "Quantity Sold", "Total Sales"])
+            total_revenue = df["Total Sales"].sum()
+            total_items = df["Quantity Sold"].sum()
 
             cols = st.columns(2)
-            cols[0].metric("Total Sales Value", format_currency(total_value))
-            cols[1].metric("Total Items Sold", f"{total_qty:,}")
+            cols[0].metric("Total Revenue", format_currency(total_revenue))
+            cols[1].metric("Items Sold", f"{total_items:,}")
 
             cols = st.columns(2)
             with cols[0]:
                 st.dataframe(df, use_container_width=True)
             with cols[1]:
-                fig = px.bar(df, x="Item", y="Total Value",
-                            title="Sales by Item")
+                fig = px.bar(df, x="Item", y="Total Sales", 
+                           title="Sales by Item Category")
+                fig.update_xaxes(tickangle=45)
                 st.plotly_chart(fig, use_container_width=True)
-            st.markdown(get_download_link(df, "sales_summary", "📥 Download Sales Summary CSV"), unsafe_allow_html=True)
-            st.markdown(get_excel_link(df, "sales_summary", "📊 Download Sales Summary Excel"), unsafe_allow_html=True)
+
+            st.markdown(get_download_link(df, "sales_summary", "📥 Download CSV"), unsafe_allow_html=True)
         else:
             st.info("No sales found for the selected period")
 
     elif report_type == "Inventory Valuation":
         st.subheader("📦 Inventory Valuation Report")
-
+        
         query = """
-            SELECT item, size, quantity, unit_cost,
-                   (quantity * unit_cost) as total_value
+            SELECT item, size, quantity, unit_cost, (quantity * unit_cost) as total_value
             FROM uniform_stock
+            WHERE quantity > 0
             ORDER BY total_value DESC
         """
         results = execute_query(conn, query, fetch=True)
 
         if results:
             df = pd.DataFrame(results, columns=["Item", "Size", "Quantity", "Unit Cost", "Total Value"])
-            total_value = df["Total Value"].sum()
+            total_inventory_value = df["Total Value"].sum()
+            total_items = df["Quantity"].sum()
 
-            st.metric("Total Inventory Value", format_currency(total_value))
+            cols = st.columns(3)
+            cols[0].metric("Total Inventory Value", format_currency(total_inventory_value))
+            cols[1].metric("Total Items", f"{total_items:,}")
+            cols[2].metric("Average Item Value", format_currency(total_inventory_value / total_items if total_items > 0 else 0))
+
             st.dataframe(df, use_container_width=True)
 
-            fig = px.treemap(df, path=["Item", "Size"], values="Total Value",
-                            title="Inventory Value Distribution")
-            st.plotly_chart(fig, use_container_width=True)
-            st.markdown(get_download_link(df, "inventory_valuation", "📥 Download Inventory Valuation CSV"), unsafe_allow_html=True)
-            st.markdown(get_excel_link(df, "inventory_valuation", "📊 Download Inventory Valuation Excel"), unsafe_allow_html=True)
+            # Low stock alert
+            low_stock = df[df["Quantity"] <= 5]
+            if not low_stock.empty:
+                st.warning("⚠️ Low Stock Alert")
+                st.dataframe(low_stock, use_container_width=True)
+
+            st.markdown(get_download_link(df, "inventory_valuation", "📥 Download CSV"), unsafe_allow_html=True)
         else:
             st.info("No inventory items found")
 
     elif report_type == "Monthly Trends":
-        st.subheader("📅 Monthly Trends Analysis")
+        st.subheader("📊 Monthly Trends Analysis")
+        
+        # Get last 12 months data
+        end_date = date.today()
+        start_date = end_date.replace(year=end_date.year - 1)
 
-        # Get monthly expenses
+        # Expenses trend
         expense_query = """
-            SELECT TO_CHAR(date, 'YYYY-MM') as month,
-                   SUM(amount) as expenses
+            SELECT DATE_TRUNC('month', date) as month, SUM(amount) as total_expenses
             FROM expenses
+            WHERE date >= %s
             GROUP BY month
             ORDER BY month
         """
-        expenses = execute_query(conn, expense_query, fetch=True)
+        expense_results = execute_query(conn, expense_query, (start_date,), fetch=True)
 
-        # Get monthly sales
+        # Sales trend
         sales_query = """
-            SELECT TO_CHAR(date, 'YYYY-MM') as month,
-                   SUM(quantity * selling_price) as sales
+            SELECT DATE_TRUNC('month', date) as month, SUM(quantity * selling_price) as total_sales
             FROM uniform_sales
+            WHERE date >= %s
             GROUP BY month
             ORDER BY month
         """
-        sales = execute_query(conn, sales_query, fetch=True)
+        sales_results = execute_query(conn, sales_query, (start_date,), fetch=True)
 
-        # Create DataFrames
-        expense_df = pd.DataFrame(expenses or [], columns=["Month", "Expenses"])
-        sales_df = pd.DataFrame(sales or [], columns=["Month", "Sales"])
+        if expense_results or sales_results:
+            # Create combined dataframe
+            expense_df = pd.DataFrame(expense_results, columns=["Month", "Expenses"]) if expense_results else pd.DataFrame(columns=["Month", "Expenses"])
+            sales_df = pd.DataFrame(sales_results, columns=["Month", "Sales"]) if sales_results else pd.DataFrame(columns=["Month", "Sales"])
 
-        # Merge data
-        if not expense_df.empty or not sales_df.empty:
-            df = pd.merge(expense_df, sales_df, on="Month", how="outer").fillna(0)
+            # Merge dataframes
+            if not expense_df.empty and not sales_df.empty:
+                trend_df = pd.merge(expense_df, sales_df, on="Month", how="outer")
+            elif not expense_df.empty:
+                trend_df = expense_df.copy()
+                trend_df["Sales"] = 0
+            elif not sales_df.empty:
+                trend_df = sales_df.copy()
+                trend_df["Expenses"] = 0
+            else:
+                trend_df = pd.DataFrame()
 
-            # Calculate profit
-            df["Profit"] = df["Sales"] - df["Expenses"]
-            df = df.sort_values(by="Month").reset_index(drop=True)
+            if not trend_df.empty:
+                trend_df = trend_df.fillna(0)
+                trend_df["Month"] = pd.to_datetime(trend_df["Month"])
+                trend_df["Net"] = trend_df["Sales"] - trend_df["Expenses"]
 
-            # Show metrics
-            if not df.empty:
-                latest = df.iloc[-1]
-                cols = st.columns(3)
-                cols[0].metric("Latest Month", latest["Month"])
-                cols[1].metric("Expenses", format_currency(latest["Expenses"]))
-                cols[2].metric("Sales", format_currency(latest["Sales"]))
+                # Plot trends
+                fig = px.line(trend_df, x="Month", y=["Expenses", "Sales", "Net"],
+                            title="Monthly Financial Trends",
+                            labels={"value": "Amount (KES)", "variable": "Category"})
+                st.plotly_chart(fig, use_container_width=True)
 
-                if len(df) > 1:
-                    prev = df.iloc[-2]
-                    delta_exp = latest["Expenses"] - prev["Expenses"]
-                    delta_sales = latest["Sales"] - prev["Sales"]
-
-                    cols = st.columns(2)
-                    cols[0].metric("Expenses Change (vs Prev. Month)", format_currency(delta_exp), delta=f"{delta_exp:,.2f}")
-                    cols[1].metric("Sales Change (vs Prev. Month)", format_currency(delta_sales), delta=f"{delta_sales:,.2f}")
-
-            # Show trend chart
-            fig = px.line(df, x="Month", y=["Expenses", "Sales", "Profit"],
-                         title="Monthly Financial Trends",
-                         labels={"value": "Amount (KES)", "variable": "Category"},
-                         hover_data={"value": ":,.2f"}) # Format hover tooltip
-            fig.update_layout(hovermode="x unified") # Show hover for all lines on same x-axis
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.dataframe(df, use_container_width=True)
-            st.markdown(get_download_link(df, "monthly_trends", "📥 Download Monthly Trends CSV"), unsafe_allow_html=True)
-            st.markdown(get_excel_link(df, "monthly_trends", "📊 Download Monthly Trends Excel"), unsafe_allow_html=True)
+                st.dataframe(trend_df, use_container_width=True)
+                st.markdown(get_download_link(trend_df, "monthly_trends", "📥 Download CSV"), unsafe_allow_html=True)
+            else:
+                st.info("No data available for trend analysis")
         else:
-            st.info("No financial data available for trend analysis")
+            st.info("No data available for the last 12 months")
 
-def show_dashboard(conn):
-    """Main dashboard view"""
-    st.header("📊 Financial Dashboard")
+def show_receipts_tab(conn):
+    """Receipt management tab"""
+    st.header("🧾 Receipt Management")
+
+    # Search and filter receipts
+    with st.expander("🔍 Search Receipts"):
+        cols = st.columns(3)
+        with cols[0]:
+            start_date = st.date_input("From Date", value=date.today() - timedelta(days=30))
+        with cols[1]:
+            end_date = st.date_input("To Date", value=date.today())
+        with cols[2]:
+            search_term = st.text_input("Search Receipt ID or Customer")
+
+    # Build query
+    query = """
+        SELECT receipt_id, date, customer_name, total_amount, 
+               payment_mode, reference, issued_by, created_at
+        FROM receipts
+        WHERE date BETWEEN %s AND %s
+    """
+    params = [start_date, end_date]
+
+    if search_term:
+        query += " AND (receipt_id ILIKE %s OR customer_name ILIKE %s)"
+        params.extend([f"%{search_term}%", f"%{search_term}%"])
+
+    query += " ORDER BY created_at DESC"
+
+    receipts = execute_query(conn, query, params, fetch=True)
+
+    if receipts:
+        st.subheader("📋 Receipt History")
+        
+        for receipt in receipts:
+            with st.expander(f"Receipt {receipt['receipt_id']} - {format_currency(receipt['total_amount'])} ({receipt['date']})"):
+                cols = st.columns(2)
+                with cols[0]:
+                    st.write(f"**Customer:** {receipt['customer_name'] or 'Walk-in Customer'}")
+                    st.write(f"**Date:** {receipt['date']}")
+                    st.write(f"**Payment:** {receipt['payment_mode']}")
+                with cols[1]:
+                    st.write(f"**Total:** {format_currency(receipt['total_amount'])}")
+                    st.write(f"**Reference:** {receipt['reference'] or 'N/A'}")
+                    st.write(f"**Issued By:** {receipt['issued_by']}")
+
+                # Reprint receipt button
+                if st.button(f"🖨️ Reprint Receipt", key=f"reprint_{receipt['receipt_id']}"):
+                    # Get receipt details
+                    detail_query = "SELECT * FROM receipts WHERE receipt_id = %s"
+                    receipt_detail = execute_query(conn, detail_query, (receipt['receipt_id'],), fetch=True)
+                    
+                    if receipt_detail:
+                        receipt_data = receipt_detail[0]
+                        items = json.loads(receipt_data['items_json'])
+                        
+                        receipt_info = {
+                            "receipt_id": receipt_data['receipt_id'],
+                            "date": receipt_data['date'].strftime("%Y-%m-%d"),
+                            "customer_name": receipt_data['customer_name'],
+                            "items": items,
+                            "total_amount": float(receipt_data['total_amount']),
+                            "payment_mode": receipt_data['payment_mode'],
+                            "reference": receipt_data['reference'],
+                            "issued_by": receipt_data['issued_by']
+                        }
+                        
+                        receipt_html = generate_receipt_html(receipt_info)
+                        st.components.v1.html(receipt_html, height=600)
+                        
+                        # Download link
+                        st.markdown(
+                            f'<a href="data:text/html;base64,{base64.b64encode(receipt_html.encode()).decode()}" '
+                            f'download="receipt_{receipt_data["receipt_id"]}.html" target="_blank">📄 Download Receipt</a>',
+                            unsafe_allow_html=True
+                        )
+
+        # Summary statistics
+        total_receipts = len(receipts)
+        total_amount = sum(float(r['total_amount']) for r in receipts)
+        
+        cols = st.columns(2)
+        cols[0].metric("Total Receipts", total_receipts)
+        cols[1].metric("Total Amount", format_currency(total_amount))
+
+    else:
+        st.info("No receipts found for the selected criteria")
+
+def show_dashboard_tab(conn):
+    """Dashboard with key metrics"""
+    st.header("📊 Dashboard")
 
     # Current month metrics
     today = date.today()
-    first_day = today.replace(day=1)
+    month_start = today.replace(day=1)
+    
+    # Get current month data
+    expense_query = "SELECT SUM(amount) FROM expenses WHERE date >= %s"
+    sales_query = "SELECT SUM(quantity * selling_price) FROM uniform_sales WHERE date >= %s"
+    stock_query = "SELECT SUM(quantity * unit_cost) FROM uniform_stock"
+    
+    current_expenses = execute_query(conn, expense_query, (month_start,), fetch=True)
+    current_sales = execute_query(conn, sales_query, (month_start,), fetch=True)
+    stock_value = execute_query(conn, stock_query, fetch=True)
 
-    # Expense metrics
-    expense_query = """
-        SELECT SUM(amount) FROM expenses
-        WHERE date BETWEEN %s AND %s
-    """
-    current_expenses_data = execute_query(conn, expense_query, (first_day, today), fetch=True)
-    current_expenses = current_expenses_data[0][0] if current_expenses_data and current_expenses_data[0][0] else 0.0
+    # Extract values
+    expenses_amount = float(current_expenses[0][0] or 0) if current_expenses and current_expenses[0][0] else 0
+    sales_amount = float(current_sales[0][0] or 0) if current_sales and current_sales[0][0] else 0
+    inventory_value = float(stock_value[0][0] or 0) if stock_value and stock_value[0][0] else 0
+    net_income = sales_amount - expenses_amount
 
-    # Sales metrics
-    sales_query = """
-        SELECT SUM(quantity * selling_price) FROM uniform_sales
-        WHERE date BETWEEN %s AND %s
-    """
-    current_sales_data = execute_query(conn, sales_query, (first_day, today), fetch=True)
-    current_sales = current_sales_data[0][0] if current_sales_data and current_sales_data[0][0] else 0.0
+    # Display key metrics
+    st.subheader("📈 This Month's Performance")
+    cols = st.columns(4)
+    cols[0].metric("Revenue", format_currency(sales_amount))
+    cols[1].metric("Expenses", format_currency(expenses_amount))
+    cols[2].metric("Net Income", format_currency(net_income), delta=format_currency(net_income))
+    cols[3].metric("Inventory Value", format_currency(inventory_value))
 
-    # Inventory metrics
-    inventory_query = "SELECT SUM(quantity * unit_cost) FROM uniform_stock"
-    inventory_value_data = execute_query(conn, inventory_query, fetch=True)
-    inventory_value = inventory_value_data[0][0] if inventory_value_data and inventory_value_data[0][0] else 0.0
-
-    # Display metrics
-    cols = st.columns(3)
-    cols[0].metric("Current Month Expenses", format_currency(current_expenses))
-    cols[1].metric("Current Month Sales", format_currency(current_sales))
-    cols[2].metric("Inventory Value", format_currency(inventory_value))
-
-    # Recent transactions
-    st.subheader("Recent Activity")
-
+    # Recent activity
+    st.subheader("🕒 Recent Activity")
+    
     cols = st.columns(2)
+    
     with cols[0]:
-        st.markdown("**:blue[Last 5 Expenses]**")
-        expenses = execute_query(conn, """
-            SELECT date, category, description, amount
-            FROM expenses ORDER BY date DESC LIMIT 5
-        """, fetch=True)
-        if expenses:
-            st.dataframe(pd.DataFrame(expenses, columns=["Date", "Category", "Description", "Amount"]),
-                        use_container_width=True)
+        st.markdown("**Recent Expenses**")
+        recent_expenses = execute_query(conn, 
+            "SELECT date, category, amount FROM expenses ORDER BY created_at DESC LIMIT 5", 
+            fetch=True)
+        if recent_expenses:
+            for exp in recent_expenses:
+                st.write(f"• {exp[0]} - {exp[1]}: {format_currency(exp[2])}")
         else:
-            st.info("No recent expenses")
+            st.write("No recent expenses")
 
     with cols[1]:
-        st.markdown("**:green[Last 5 Sales]**")
-        sales = execute_query(conn, """
-            SELECT date, student_name, item, quantity, selling_price
-            FROM uniform_sales ORDER BY date DESC LIMIT 5
-        """, fetch=True)
-        if sales:
-            st.dataframe(pd.DataFrame(sales, columns=["Date", "Student", "Item", "Qty", "Price"]),
-                        use_container_width=True)
+        st.markdown("**Recent Sales**")
+        recent_sales = execute_query(conn,
+            "SELECT date, item, quantity * selling_price FROM uniform_sales ORDER BY created_at DESC LIMIT 5",
+            fetch=True)
+        if recent_sales:
+            for sale in recent_sales:
+                st.write(f"• {sale[0]} - {sale[1]}: {format_currency(sale[2])}")
         else:
-            st.info("No recent sales")
+            st.write("No recent sales")
 
-def show_settings(conn):
-    """Application settings tab"""
-    st.header("⚙️ Settings")
-
-    if st.session_state.get("username") == "admin":
-        st.subheader("Database Management")
-
-        # Database Backup (for Supabase, this is usually managed via Supabase dashboard backups)
-        st.info("For Supabase, database backups are typically managed directly from the Supabase dashboard. "
-                "You can export your data in CSV/JSON formats from individual tables or use Supabase's built-in "
-                "backup features for full database snapshots.")
-
-        if st.button("Reset All Data", type="secondary"):
-            st.warning("This will delete ALL data in the database! This action is irreversible.")
-            if st.checkbox("I understand this cannot be undone and wish to proceed."):
-                if st.button("Confirm Reset", type="primary"):
-                    try:
-                        execute_query(conn, "DELETE FROM expenses")
-                        execute_query(conn, "DELETE FROM uniform_stock")
-                        execute_query(conn, "DELETE FROM uniform_sales")
-                        execute_query(conn, "DELETE FROM receipts")
-                        st.success("Database has been reset successfully!")
-                        st.cache_resource.clear() # Clear cache to reflect empty data
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed to reset database: {str(e)}")
-                        st.code(traceback.format_exc())
-    else:
-        st.warning("Only admin users can access these settings")
-
-    st.subheader("About")
-    st.write("""
-    **School Expense and Uniform Tracker** Version 2.1 (Supabase Enabled)  
-    Developed for Success Achievers School  
-    © 2024 All Rights Reserved
-    """)
+    # Quick actions
+    st.subheader("⚡ Quick Actions")
+    cols = st.columns(3)
+    
+    with cols[0]:
+        if st.button("➕ Add Expense", use_container_width=True):
+            st.session_state.active_tab = "Expenses"
+            st.rerun()
+    
+    with cols[1]:
+        if st.button("🛍️ Record Sale", use_container_width=True):
+            st.session_state.active_tab = "Sales"
+            st.rerun()
+    
+    with cols[2]:
+        if st.button("📦 Manage Stock", use_container_width=True):
+            st.session_state.active_tab = "Stock"
+            st.rerun()
 
 # ======================
 # MAIN APPLICATION
 # ======================
 def main():
     """Main application function"""
-    # Initialize session state
-    if 'logged_in' not in st.session_state:
-        st.session_state.logged_in = False
-    if 'username' not in st.session_state:
-        st.session_state.username = ""
+    st.title("🏫 Success Achievers School - Expense Tracker")
+    st.markdown("---")
 
-    # Simple login - replace with your actual authentication
-    if not st.session_state.logged_in:
-        with st.form("login_form"):
-            st.title("School Expense Tracker Login")
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-
-            if st.form_submit_button("Login", type="primary"):
-                # Simple demo authentication - replace with real auth (e.g., Supabase Auth, password hashing)
-                # For production, hash passwords and store them securely, then verify hash here.
-                # Example: hashed_password = hashlib.sha256(password.encode()).hexdigest()
-                # Check against stored hash.
-                if username == "admin" and password == "admin123":
-                    st.session_state.logged_in = True
-                    st.session_state.username = username
-                    st.success("Logged in successfully!")
-                    st.rerun()
-                else:
-                    st.error("Invalid username or password")
-        return
-
-    # Get database connection
+    # Initialize database connection
     conn = get_db_connection()
-    if conn is None:
-        st.stop() # Stop execution if database connection fails
+    if not conn:
+        st.stop()
+
+    # Initialize session state
+    if "active_tab" not in st.session_state:
+        st.session_state.active_tab = "Dashboard"
 
     # Sidebar navigation
-    with st.sidebar:
-        st.title(f"Welcome, {st.session_state.username.capitalize()} 👋")
-        st.divider()
-
-        # Quick stats for the current month
-        today = date.today()
-        first_day = today.replace(day=1)
-
-        total_expenses_data = execute_query(conn, "SELECT SUM(amount) FROM expenses WHERE date BETWEEN %s AND %s", (first_day, today), fetch=True)
-        total_expenses = total_expenses_data[0][0] if total_expenses_data and total_expenses_data[0][0] else 0.0
-
-        total_sales_data = execute_query(conn, "SELECT SUM(quantity * selling_price) FROM uniform_sales WHERE date BETWEEN %s AND %s", (first_day, today), fetch=True)
-        total_sales = total_sales_data[0][0] if total_sales_data and total_sales_data[0][0] else 0.0
-
-        st.metric("This Month's Expenses", format_currency(total_expenses))
-        st.metric("This Month's Sales", format_currency(total_sales))
-
-        st.divider()
-
-        # Navigation
-        app_page = st.radio("Navigation", [
-            "Dashboard", "Expenses", "Uniform Stock",
-            "Uniform Sales", "Reports", "Settings"
-        ], index=0) # Set default to Dashboard
-
-        st.divider()
-        if st.button("Logout", type="secondary"):
-            st.session_state.logged_in = False
-            st.session_state.username = ""
-            st.cache_resource.clear() # Clear database connection cache on logout
+    st.sidebar.title("Navigation")
+    tabs = ["Dashboard", "Expenses", "Stock", "Sales", "Reports", "Receipts"]
+    
+    for tab in tabs:
+        if st.sidebar.button(tab, use_container_width=True, 
+                           type="primary" if st.session_state.active_tab == tab else "secondary"):
+            st.session_state.active_tab = tab
             st.rerun()
 
-    # Main content area
-    if app_page == "Dashboard":
-        show_dashboard(conn)
-    elif app_page == "Expenses":
-        show_expenses_tab(conn)
-    elif app_page == "Uniform Stock":
-        show_stock_tab(conn)
-    elif app_page == "Uniform Sales":
-        show_sales_tab(conn)
-    elif app_page == "Reports":
-        show_reports_tab(conn)
-    elif app_page == "Settings":
-        show_settings(conn)
+    # Display selected tab
+    try:
+        if st.session_state.active_tab == "Dashboard":
+            show_dashboard_tab(conn)
+        elif st.session_state.active_tab == "Expenses":
+            show_expenses_tab(conn)
+        elif st.session_state.active_tab == "Stock":
+            show_stock_tab(conn)
+        elif st.session_state.active_tab == "Sales":
+            show_sales_tab(conn)
+        elif st.session_state.active_tab == "Reports":
+            show_reports_tab(conn)
+        elif st.session_state.active_tab == "Receipts":
+            show_receipts_tab(conn)
+
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+        st.code(traceback.format_exc())
+
+    finally:
+        # Footer
+        st.markdown("---")
+        st.markdown(
+            "<div style='text-align: center; color: #666;'>"
+            "Success Achievers School Expense Tracker © 2025"
+            "</div>", 
+            unsafe_allow_html=True
+        )
 
 if __name__ == "__main__":
     main()
