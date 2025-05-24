@@ -23,26 +23,30 @@ st.set_page_config(
 # ======================
 # DATABASE FUNCTIONS
 # ======================
+# Replace your existing database connection functions with these:
+
 def init_database_supabase():
     """Initialize the database with required tables in Supabase (PostgreSQL)"""
     try:
-        # Updated connection with SSL and proper Supabase settings
+        # Simplified connection with better error handling
         conn = psycopg2.connect(
             host=st.secrets.postgres.host,
             port=st.secrets.postgres.port,
             dbname=st.secrets.postgres.dbname,
             user=st.secrets.postgres.user,
             password=st.secrets.postgres.password,
-            sslmode='require',  # Required for Supabase
-            connect_timeout=10,  # Add timeout
-            keepalives_idle=600,
-            keepalives_interval=30,
-            keepalives_count=3
+            sslmode='require',
+            connect_timeout=30,  # Increased timeout
+            application_name='school_expense_tracker'  # Add app name for debugging
         )
+        
+        # Test connection
         cursor = conn.cursor()
-
+        cursor.execute("SELECT version()")
+        version = cursor.fetchone()
+        st.success(f"✅ Connected to Supabase PostgreSQL")
+        
         # Create tables if they don't exist
-        # Using IF NOT EXISTS and proper PostgreSQL types
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS expenses (
             id SERIAL PRIMARY KEY,
@@ -99,7 +103,6 @@ def init_database_supabase():
         ''')
 
         # Add receipt_id column to uniform_sales if it doesn't exist
-        # Check if column exists before adding
         cursor.execute("""
             SELECT 1 FROM information_schema.columns 
             WHERE table_name='uniform_sales' AND column_name='receipt_id'
@@ -110,26 +113,34 @@ def init_database_supabase():
         conn.commit()
         cursor.close()
         return conn
+        
     except psycopg2.OperationalError as e:
-        st.error(f"Database connection failed: {str(e)}")
-        st.error("Please check your Supabase connection settings and ensure:")
-        st.error("1. Your Supabase project is active")
-        st.error("2. Database credentials are correct")
-        st.error("3. Your IP is whitelisted (if IP restrictions are enabled)")
-        st.error("4. SSL is properly configured")
-        st.code(traceback.format_exc())
+        error_msg = str(e)
+        st.error("🚨 **Database Connection Failed**")
+        
+        if "Cannot assign requested address" in error_msg:
+            st.error("**Network connectivity issue detected.** This usually means:")
+            st.markdown("""
+            - Streamlit Cloud cannot reach your Supabase instance
+            - Your Supabase project might be paused/inactive
+            - Network restrictions between Streamlit Cloud and Supabase
+            """)
+        elif "authentication failed" in error_msg:
+            st.error("**Authentication failed.** Check your credentials in Streamlit secrets.")
+        else:
+            st.error(f"**Connection error:** {error_msg}")
+            
         return None
+        
     except Exception as e:
-        st.error(f"Failed to initialize Supabase database: {str(e)}")
-        st.code(traceback.format_exc())
+        st.error(f"**Unexpected error:** {str(e)}")
         return None
 
-# Alternative connection method using connection string
 def init_database_supabase_alt():
-    """Alternative connection method using full connection string"""
+    """Alternative connection method using connection URI"""
     try:
-        # Construct connection string - replace [YOUR-PASSWORD] with actual password
-        conn_string = f"postgresql://{st.secrets.postgres.user}:{st.secrets.postgres.password}@{st.secrets.postgres.host}:{st.secrets.postgres.port}/{st.secrets.postgres.dbname}?sslmode=require"
+        # Fix the connection string format
+        conn_string = f"postgresql://{st.secrets.postgres.user}:{st.secrets.postgres.password}@{st.secrets.postgres.host}:{st.secrets.postgres.port}/{st.secrets.postgres.dbname}?sslmode=require&connect_timeout=30"
         
         conn = psycopg2.connect(conn_string)
         cursor = conn.cursor()
@@ -137,7 +148,7 @@ def init_database_supabase_alt():
         # Test connection
         cursor.execute("SELECT version()")
         version = cursor.fetchone()
-        st.success(f"Connected to PostgreSQL: {version[0]}")
+        st.success(f"✅ Alternative connection successful")
 
         # Create tables (same as above)
         cursor.execute('''
@@ -206,54 +217,92 @@ def init_database_supabase_alt():
         conn.commit()
         cursor.close()
         return conn
+        
     except Exception as e:
-        st.error(f"Alternative connection method failed: {str(e)}")
-        st.code(traceback.format_exc())
+        st.error(f"**Alternative connection failed:** {str(e)}")
         return None
+
+# Add this new function for troubleshooting
+def test_supabase_connection():
+    """Test Supabase connection and show detailed diagnostics"""
+    st.subheader("🔧 Connection Diagnostics")
+    
+    try:
+        # Show connection parameters (without password)
+        st.info(f"""
+        **Connection Parameters:**
+        - Host: {st.secrets.postgres.host}
+        - Port: {st.secrets.postgres.port}
+        - Database: {st.secrets.postgres.dbname}
+        - User: {st.secrets.postgres.user}
+        """)
+        
+        # Try ping first
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        result = sock.connect_ex((st.secrets.postgres.host, int(st.secrets.postgres.port)))
+        sock.close()
+        
+        if result == 0:
+            st.success("✅ Network connectivity to Supabase host is working")
+        else:
+            st.error("❌ Cannot reach Supabase host - network connectivity issue")
+            return False
+            
+    except Exception as e:
+        st.error(f"Network test failed: {str(e)}")
+        return False
+    
+    return True
 
 @st.cache_resource
 def get_db_connection():
-    """Get a cached database connection for Supabase"""
+    """Get a cached database connection for Supabase with better error handling"""
+    
+    # First run connection diagnostics
+    if not test_supabase_connection():
+        st.error("**Network connectivity issue detected. Possible solutions:**")
+        st.markdown("""
+        1. **Check Supabase Project Status:** 
+           - Go to your Supabase dashboard
+           - Ensure your project is active (not paused)
+           
+        2. **Verify Connection Details:**
+           - Double-check your connection string in Supabase settings
+           - Ensure all credentials in Streamlit secrets are correct
+           
+        3. **Alternative Deployment Options:**
+           - **Render.com** (free tier with PostgreSQL support)
+           - **Railway.app** (good PostgreSQL integration)
+           - **Heroku** (with Heroku Postgres addon)
+        """)
+        return None
+    
     # Try primary connection method first
     conn = init_database_supabase()
     
     # If primary fails, try alternative method
     if conn is None:
-        st.warning("Primary connection failed, trying alternative method...")
+        st.warning("⚠️ Primary connection failed, trying alternative method...")
         conn = init_database_supabase_alt()
     
+    if conn is None:
+        st.error("❌ **Both connection methods failed.**")
+        st.markdown("""
+        ### 🚀 **Recommended Solution: Switch to Railway**
+        
+        Railway.app offers excellent PostgreSQL support and is more reliable for Streamlit apps:
+        
+        1. **Create a Railway account** at railway.app
+        2. **Deploy a PostgreSQL database** (free tier available)
+        3. **Update your Streamlit secrets** with Railway connection details
+        4. **Redeploy your app**
+        
+        Railway typically has better network compatibility with Streamlit Cloud.
+        """)
+    
     return conn
-
-def execute_query(_conn, query, params=None, fetch=False):
-    """Execute a SQL query with error handling for PostgreSQL"""
-    if _conn is None:
-        st.error("Database connection is not established.")
-        return None
-
-    try:
-        cursor = _conn.cursor()
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
-
-        if fetch:
-            result = cursor.fetchall()
-        else:
-            _conn.commit()
-            result = True
-
-        cursor.close()
-        return result
-    except psycopg2.Error as e:
-        st.error(f"Database error: {e.pgcode} - {e.pgerror}")
-        st.code(traceback.format_exc())
-        _conn.rollback() # Rollback in case of error
-        return None
-    except Exception as e:
-        st.error(f"An unexpected error occurred during query execution: {str(e)}")
-        st.code(traceback.format_exc())
-        return None
 
 # ======================
 # UTILITY FUNCTIONS
