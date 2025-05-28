@@ -58,9 +58,32 @@ def get_database_url():
     
     return None
 
-def execute_query(conn, query, params=None, fetch=False):
-    """Execute database query with better error handling"""
+def is_connection_active(conn):
+    """Check if the database connection is active."""
+    if conn is None:
+        return False
     try:
+        # Pinging the database to check if the connection is still alive
+        conn.cursor().execute("SELECT 1")
+        return True
+    except psycopg2.Error:
+        return False
+    except Exception:
+        return False
+
+def execute_query(conn, query, params=None, fetch=False, retry_count=0):
+    """Execute database query with better error handling and retry mechanism."""
+    max_retries = 1 # Allow one retry if connection fails
+    
+    try:
+        if not is_connection_active(conn):
+            st.warning("Database connection is not active. Attempting to re-establish...")
+            # Re-establish connection through the cached function
+            conn = get_db_connection(force_reconnect=True) 
+            if not conn:
+                st.error("Failed to re-establish database connection.")
+                return False if not fetch else None
+
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(query, params)
             
@@ -71,12 +94,28 @@ def execute_query(conn, query, params=None, fetch=False):
                 return True
                 
     except psycopg2.Error as e:
-        conn.rollback()
-        st.error(f"Database error: {e}")
-        return False if not fetch else None
+        # Check if the error is due to a closed connection and retry
+        if "connection already closed" in str(e).lower() and retry_count < max_retries:
+            st.warning(f"Connection closed during query. Retrying... (Attempt {retry_count + 1})")
+            # Force re-initialization of the connection
+            conn = get_db_connection(force_reconnect=True)
+            if conn:
+                return execute_query(conn, query, params, fetch, retry_count + 1)
+            else:
+                st.error("Failed to re-establish connection after retry.")
+                return False if not fetch else None
+        else:
+            # Only rollback if the connection is still active to avoid nested errors
+            if is_connection_active(conn):
+                conn.rollback()
+            st.error(f"Database error: {e}")
+            st.code(traceback.format_exc()) # Show full traceback for database errors
+            return False if not fetch else None
     except Exception as e:
-        conn.rollback()
-        st.error(f"Unexpected error: {e}")
+        # For unexpected errors, log and return appropriate value
+        # Do NOT attempt rollback here, as the connection state is unknown
+        st.error(f"Unexpected error during query execution: {e}")
+        st.code(traceback.format_exc())
         return False if not fetch else None
 
 def init_database():
@@ -140,7 +179,7 @@ def init_database():
         return None
         
     except Exception as e:
-        st.error(f"**Unexpected error:** {e}")
+        st.error(f"**Unexpected error during database initialization:** {e}")
         st.code(traceback.format_exc())
         return None
 
@@ -217,6 +256,18 @@ def create_tables(conn):
             
             for index_sql in indexes:
                 cursor.execute(index_sql)
+
+            # Ensure 'created_at' column exists in 'expenses' table for older deployments
+            # This is a safe way to add the column if it's missing without dropping the table
+            cursor.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='expenses' AND column_name='created_at') THEN
+                        ALTER TABLE expenses ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                    END IF;
+                END
+                $$;
+            """)
                 
         conn.commit()
         st.success("📊 Database tables initialized successfully!")
@@ -226,8 +277,11 @@ def create_tables(conn):
         conn.rollback()
 
 @st.cache_resource
-def get_db_connection():
-    """Get cached database connection"""
+def get_db_connection(force_reconnect=False):
+    """Get cached database connection. 
+    If force_reconnect is True, a new connection is established."""
+    if force_reconnect:
+        st.cache_resource.clear() # Clear the cache to force a new connection
     return init_database()
 
 # ======================
@@ -354,6 +408,7 @@ def save_receipt(conn, receipt_data):
         return execute_query(conn, query, params)
     except Exception as e:
         st.error(f"Failed to save receipt: {str(e)}")
+        st.code(traceback.format_exc())
         return False
 
 # ======================
@@ -439,7 +494,7 @@ def show_expenses_tab(conn):
         query += " AND description ILIKE %s"
         params.append(f"%{search_term}%")
 
-    query += " ORDER BY date DESC"
+    query += " ORDER BY date DESC" # Changed to ORDER BY date DESC for robustness
 
     expenses = execute_query(conn, query, params, fetch=True)
     if expenses:
@@ -951,81 +1006,297 @@ def show_receipts_tab(conn):
         st.info("No receipts found for the selected criteria")
 
 def show_dashboard_tab(conn):
-    """Dashboard with key metrics"""
+    """Dashboard with key metrics and comprehensive overview"""
     st.header("📊 Dashboard")
 
     # Current month metrics
     today = date.today()
     month_start = today.replace(day=1)
+    year_start = today.replace(month=1, day=1)
     
-    # Get current month data
-    expense_query = "SELECT SUM(amount) FROM expenses WHERE date >= %s"
-    sales_query = "SELECT SUM(quantity * selling_price) FROM uniform_sales WHERE date >= %s"
-    stock_query = "SELECT SUM(quantity * unit_cost) FROM uniform_stock"
+    # Get current month data with proper column aliases
+    expense_query = "SELECT COALESCE(SUM(amount), 0) as total_expenses FROM expenses WHERE date >= %s"
+    sales_query = "SELECT COALESCE(SUM(quantity * selling_price), 0) as total_sales FROM uniform_sales WHERE date >= %s"
+    stock_query = "SELECT COALESCE(SUM(quantity * unit_cost), 0) as stock_value FROM uniform_stock"
     
-    current_expenses = execute_query(conn, expense_query, (month_start,), fetch=True)
-    current_sales = execute_query(conn, sales_query, (month_start,), fetch=True)
-    stock_value = execute_query(conn, stock_query, fetch=True)
+    # Year-to-date queries
+    ytd_expense_query = "SELECT COALESCE(SUM(amount), 0) as ytd_expenses FROM expenses WHERE date >= %s"
+    ytd_sales_query = "SELECT COALESCE(SUM(quantity * selling_price), 0) as ytd_sales FROM uniform_sales WHERE date >= %s"
+    
+    try:
+        # Current month data
+        current_expenses = execute_query(conn, expense_query, (month_start,), fetch=True)
+        current_sales = execute_query(conn, sales_query, (month_start,), fetch=True)
+        stock_value = execute_query(conn, stock_query, fetch=True)
+        
+        # Year-to-date data
+        ytd_expenses = execute_query(conn, ytd_expense_query, (year_start,), fetch=True)
+        ytd_sales = execute_query(conn, ytd_sales_query, (year_start,), fetch=True)
 
-    # Extract values
-    expenses_amount = float(current_expenses[0][0] or 0) if current_expenses and current_expenses[0][0] else 0
-    sales_amount = float(current_sales[0][0] or 0) if current_sales and current_sales[0][0] else 0
-    inventory_value = float(stock_value[0][0] or 0) if stock_value and stock_value[0][0] else 0
-    net_income = sales_amount - expenses_amount
+        # Extract values using dictionary keys (since we're using RealDictCursor)
+        expenses_amount = float(current_expenses[0]['total_expenses']) if current_expenses and current_expenses[0] else 0
+        sales_amount = float(current_sales[0]['total_sales']) if current_sales and current_sales[0] else 0
+        inventory_value = float(stock_value[0]['stock_value']) if stock_value and stock_value[0] else 0
+        net_income = sales_amount - expenses_amount
+        
+        ytd_expenses_amount = float(ytd_expenses[0]['ytd_expenses']) if ytd_expenses and ytd_expenses[0] else 0
+        ytd_sales_amount = float(ytd_sales[0]['ytd_sales']) if ytd_sales and ytd_sales[0] else 0
+        ytd_net_income = ytd_sales_amount - ytd_expenses_amount
 
-    # Display key metrics
-    st.subheader("📈 This Month's Performance")
-    cols = st.columns(4)
-    cols[0].metric("Revenue", format_currency(sales_amount))
-    cols[1].metric("Expenses", format_currency(expenses_amount))
-    cols[2].metric("Net Income", format_currency(net_income), delta=format_currency(net_income))
-    cols[3].metric("Inventory Value", format_currency(inventory_value))
+        # Display key metrics
+        st.subheader("📈 This Month's Performance")
+        cols = st.columns(4)
+        with cols[0]:
+            st.metric(
+                "Monthly Revenue", 
+                format_currency(sales_amount),
+                delta=f"vs YTD Avg: {format_currency(ytd_sales_amount / max(today.month, 1))}"
+            )
+        with cols[1]:
+            st.metric(
+                "Monthly Expenses", 
+                format_currency(expenses_amount),
+                delta=f"vs YTD Avg: {format_currency(ytd_expenses_amount / max(today.month, 1))}"
+            )
+        with cols[2]:
+            delta_color = "normal" if net_income >= 0 else "inverse"
+            st.metric(
+                "Monthly Net Income", 
+                format_currency(net_income),
+                delta=format_currency(net_income)
+            )
+        with cols[3]:
+            st.metric("Inventory Value", format_currency(inventory_value))
 
-    # Recent activity
-    st.subheader("🕒 Recent Activity")
-    
-    cols = st.columns(2)
-    
-    with cols[0]:
-        st.markdown("**Recent Expenses**")
-        recent_expenses = execute_query(conn, 
-            "SELECT date, category, amount FROM expenses ORDER BY created_at DESC LIMIT 5", 
-            fetch=True)
-        if recent_expenses:
-            for exp in recent_expenses:
-                st.write(f"• {exp[0]} - {exp[1]}: {format_currency(exp[2])}")
+        # Year-to-date summary
+        st.subheader("📅 Year-to-Date Summary")
+        cols = st.columns(3)
+        with cols[0]:
+            st.metric("YTD Revenue", format_currency(ytd_sales_amount))
+        with cols[1]:
+            st.metric("YTD Expenses", format_currency(ytd_expenses_amount))
+        with cols[2]:
+            st.metric("YTD Net Income", format_currency(ytd_net_income))
+
+        # Recent activity section
+        st.subheader("🕒 Recent Activity")
+        
+        cols = st.columns(2)
+        
+        with cols[0]:
+            st.markdown("**📤 Recent Expenses**")
+            # Changed ORDER BY to 'date' for robustness if 'created_at' is still an issue on some deployments
+            recent_expenses = execute_query(conn, 
+                "SELECT date, category, description, amount FROM expenses ORDER BY date DESC LIMIT 5", 
+                fetch=True) 
+            
+            if recent_expenses:
+                for exp in recent_expenses:
+                    with st.container():
+                        st.write(f"**{exp['date']}** - {exp['category']}")
+                        st.write(f"*{exp['description'][:50]}{'...' if len(exp['description']) > 50 else ''}*")
+                        st.write(f"**{format_currency(exp['amount'])}**")
+                        st.markdown("---")
+            else:
+                st.info("No recent expenses recorded")
+
+        with cols[1]:
+            st.markdown("**🛍️ Recent Sales**")
+            recent_sales = execute_query(conn,
+                """SELECT date, item, size, quantity, selling_price, 
+                   (quantity * selling_price) as total, student_name 
+                   FROM uniform_sales ORDER BY created_at DESC LIMIT 5""",
+                fetch=True)
+            
+            if recent_sales:
+                for sale in recent_sales:
+                    with st.container():
+                        student = sale['student_name'] if sale['student_name'] else "Walk-in Customer"
+                        st.write(f"**{sale['date']}** - {sale['item']} ({sale['size']})")
+                        st.write(f"*Customer: {student} | Qty: {sale['quantity']}*")
+                        st.write(f"**{format_currency(sale['total'])}**")
+                        st.markdown("---")
+            else:
+                st.info("No recent sales recorded")
+
+        # Category breakdown for current month
+        st.subheader("📊 Monthly Expense Breakdown")
+        category_query = """
+            SELECT category, COALESCE(SUM(amount), 0) as total
+            FROM expenses 
+            WHERE date >= %s 
+            GROUP BY category 
+            ORDER BY total DESC
+        """
+        categories = execute_query(conn, category_query, (month_start,), fetch=True)
+        
+        if categories:
+            cols = st.columns([2, 1])
+            with cols[0]:
+                # Create pie chart data
+                category_names = [cat['category'] for cat in categories]
+                category_amounts = [float(cat['total']) for cat in categories]
+                
+                if any(amount > 0 for amount in category_amounts):
+                    fig = px.pie(
+                        values=category_amounts, 
+                        names=category_names,
+                        title="Expense Distribution by Category"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No expenses to display in chart")
+            
+            with cols[1]:
+                st.markdown("**Category Totals:**")
+                for cat in categories:
+                    if cat['total'] > 0:
+                        st.write(f"• **{cat['category']}**: {format_currency(cat['total'])}")
+
+        # Top selling items
+        st.subheader("🏆 Top Selling Items (This Month)")
+        top_items_query = """
+            SELECT item, SUM(quantity) as total_qty, 
+                   SUM(quantity * selling_price) as total_revenue
+            FROM uniform_sales 
+            WHERE date >= %s 
+            GROUP BY item 
+            ORDER BY total_revenue DESC 
+            LIMIT 5
+        """
+        top_items = execute_query(conn, top_items_query, (month_start,), fetch=True)
+        
+        if top_items:
+            cols = st.columns(len(top_items))
+            for i, item in enumerate(top_items):
+                with cols[i]:
+                    st.metric(
+                        item['item'],
+                        f"{item['total_qty']} sold",
+                        delta=format_currency(item['total_revenue'])
+                    )
         else:
-            st.write("No recent expenses")
+            st.info("No sales data available for this month")
 
-    with cols[1]:
-        st.markdown("**Recent Sales**")
-        recent_sales = execute_query(conn,
-            "SELECT date, item, quantity * selling_price FROM uniform_sales ORDER BY created_at DESC LIMIT 5",
-            fetch=True)
-        if recent_sales:
-            for sale in recent_sales:
-                st.write(f"• {sale[0]} - {sale[1]}: {format_currency(sale[2])}")
+        # Low stock alerts
+        st.subheader("⚠️ Low Stock Alerts")
+        low_stock_query = """
+            SELECT item, size, quantity, unit_cost
+            FROM uniform_stock 
+            WHERE quantity <= 5 AND quantity > 0
+            ORDER BY quantity ASC
+        """
+        low_stock = execute_query(conn, low_stock_query, fetch=True)
+        
+        if low_stock:
+            st.warning(f"🚨 {len(low_stock)} items are running low on stock!")
+            cols = st.columns(min(len(low_stock), 4))
+            for i, item in enumerate(low_stock[:4]):  # Show max 4 items
+                with cols[i % 4]:
+                    st.error(f"**{item['item']}** ({item['size']})")
+                    st.write(f"Only {item['quantity']} left")
+                    
+            if len(low_stock) > 4:
+                st.write(f"... and {len(low_stock) - 4} more items")
         else:
-            st.write("No recent sales")
+            st.success("✅ All items are adequately stocked")
+
+        # Quick stats cards
+        st.subheader("📈 Quick Statistics")
+        
+        # Get additional statistics
+        stats_queries = {
+            'total_transactions': "SELECT COUNT(*) as count FROM uniform_sales WHERE date >= %s",
+            'avg_sale_value': "SELECT COALESCE(AVG(quantity * selling_price), 0) as avg FROM uniform_sales WHERE date >= %s",
+            'unique_customers': "SELECT COUNT(DISTINCT student_name) as count FROM uniform_sales WHERE date >= %s AND student_name IS NOT NULL",
+            'total_stock_items': "SELECT COALESCE(SUM(quantity), 0) as total FROM uniform_stock" # Added COALESCE here
+        }
+        
+        stats_results = {}
+        for key, query in stats_queries.items():
+            if key == 'total_stock_items':
+                result = execute_query(conn, query, fetch=True)
+            else:
+                result = execute_query(conn, query, (month_start,), fetch=True)
+            stats_results[key] = result[0] if result else {}
+
+        cols = st.columns(4)
+        with cols[0]:
+            transactions = stats_results['total_transactions'].get('count', 0) if stats_results['total_transactions'] else 0
+            st.metric("Monthly Transactions", f"{transactions:,}")
+        
+        with cols[1]:
+            avg_sale = stats_results['avg_sale_value'].get('avg', 0) if stats_results['avg_sale_value'] else 0
+            st.metric("Avg Sale Value", format_currency(float(avg_sale)))
+        
+        with cols[2]:
+            customers = stats_results['unique_customers'].get('count', 0) if stats_results['unique_customers'] else 0
+            st.metric("Unique Customers", f"{customers:,}")
+        
+        with cols[3]:
+            stock_items = stats_results['total_stock_items'].get('total', 0) if stats_results['total_stock_items'] else 0
+            st.metric("Total Stock Items", f"{stock_items:,}")
+
+    except Exception as e:
+        st.error(f"Error loading dashboard data: {str(e)}")
+        st.code(traceback.format_exc())
 
     # Quick actions
     st.subheader("⚡ Quick Actions")
-    cols = st.columns(3)
+    cols = st.columns(5)
     
     with cols[0]:
-        if st.button("➕ Add Expense", use_container_width=True):
+        if st.button("➕ Add Expense", use_container_width=True, type="primary"):
             st.session_state.active_tab = "Expenses"
             st.rerun()
     
     with cols[1]:
-        if st.button("🛍️ Record Sale", use_container_width=True):
+        if st.button("🛍️ Record Sale", use_container_width=True, type="primary"):
             st.session_state.active_tab = "Sales"
             st.rerun()
     
     with cols[2]:
-        if st.button("📦 Manage Stock", use_container_width=True):
+        if st.button("📦 Manage Stock", use_container_width=True, type="primary"):
             st.session_state.active_tab = "Stock"
             st.rerun()
+    
+    with cols[3]:
+        if st.button("📊 View Reports", use_container_width=True):
+            st.session_state.active_tab = "Reports"
+            st.rerun()
+    
+    with cols[4]:
+        if st.button("🧾 View Receipts", use_container_width=True):
+            st.session_state.active_tab = "Receipts"
+            st.rerun()
+
+    # Performance tips
+    with st.expander("💡 Performance Tips"):
+        st.markdown("""
+        **To optimize your school's financial management:**
+        
+        • **Monitor cash flow**: Keep track of monthly net income trends
+        • **Stock management**: Reorder items when they reach low stock levels
+        • **Expense tracking**: Categorize all expenses for better budgeting
+        • **Regular reports**: Review monthly and yearly performance reports
+        • **Receipt management**: Keep digital copies of all transactions
+        """)
+
+    # System status
+    with st.expander("🔧 System Status"):
+        try:
+            # Test database connection
+            test_query = "SELECT COUNT(*) as count FROM expenses LIMIT 1"
+            test_result = execute_query(conn, test_query, fetch=True)
+            
+            if test_result:
+                st.success("✅ Database connection is healthy")
+                st.info(f"📊 System last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                st.warning("⚠️ Database connection issue detected")
+                
+        except Exception as e:
+            st.error(f"❌ System check failed: {str(e)}")
 
 # ======================
 # MAIN APPLICATION
@@ -1036,7 +1307,8 @@ def main():
     st.markdown("---")
 
     # Initialize database connection
-    conn = get_db_connection()
+    # Pass force_reconnect=False by default, only force reconnect if needed by execute_query
+    conn = get_db_connection(force_reconnect=False) 
     if not conn:
         st.stop()
 
